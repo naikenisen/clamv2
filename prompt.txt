@@ -20,6 +20,7 @@ Contraintes NON négociables :
 - L’implémentation NE DOIT PAS simplifier l’attention
 - L’architecture des fichiers DOIT être conservée
 - Le script doit générer et sauvegarder un fichier splits.json (ou csv) contenant les IDs des patients pour chaque set, afin que infer.py charge strictement le test set.
+- ne pas toucher au dossier preprocessing des WSI (on suppose que les tiles sont déjà extraites)
 
 Structure du repository (à respecter strictement) :
 
