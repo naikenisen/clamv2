@@ -1,23 +1,96 @@
-﻿Prompt de base : 
+﻿Tu es un ingénieur ML senior spécialisé en Multiple Instance Learning
+et en histopathologie computationnelle, avec une connaissance approfondie
+de l’implémentation officielle de CLAM (Mahmood Lab) : https://github.com/mahmoodlab/CLAM.
 
-Dans ce repository, je souhaites entrainer un modèle de type CLAM (Clustering-constrained Attention Multiple-instance learning) pour des fins de classification de patients selon leur statut progresseur ou répondeur à la chimiothérapie du DLBCL. J’ai déjà construit une organistation du code que je souhaites conserver, à savoir, un dossier src avec data_loader.py et model.py et un fichier train.py et infer.py. L’idée est que en exécutant train.py, un modèle.pth soit construit et qu’il puisse être utilisé par infer.py pour faire une inférence. 
-Le Dataset à utiliser se trouves dans le dossier dataset_tiles. Chacun des sous dossiers de /dataset_tiles correspondent à un patient et par conséquent à une WSI. La classe de chaque patients (progresseur ou répondeur) est noté dans le fichier csv clinical_data.csv. Dans la colonne «patient_id » se trouve le code des patient =   des sous dossiers = nom des WSI ET dans la colonne « status » se trouves la classe de chaque patients (progresseur ou répondeur) codé 0 pour répondeur et 1 pour progresseur. Chaque dossiers patient contient des tiles de la WSI qui sont nommé suivant le code du patient avec « _1 », « _2 » etc, ou « _2_1 » si la WSI était contenu sur deux images code.png et « code₂.png » par exemple. 
-Peut tu me compléter mon repository pour que les scriptes me permettent d’entrainer un CLAM et de faire des inférences. Sachant que le dataset sera découpé en train, valide, test. Ce découpage pourra avoir lieu dans le scripte data_loader.py en utilisant un random seed afin que le train set puisse être chargé à l’identique par le scripte infer.py lors de l’inférence en appelant data_loader.py. 
-Il faut bien comprendre que le fichier clinical_data.csv donne une labelisation slide level (WSI). Nous travaillons avec des lames d’histologie WSI colorées HES. Les tiles ont été découpés et enregistrés dans le dossier dataset_tiles sous la forme d’images png de  256 pixels par 256 pixels sans overlap par create_tiles.py. Les features ne sont pas encore extraites. Je veux que le CLAM utilise l’Attention constrain. Le framework utilisé doit être PyTorch. L’entrainement sera réalisé sur une Nvidia A100 80 gb. 
-Voici les points très important qu’il faut considérer durant la création du repo : 
-Inspire-toi de l'implémentation officielle de CLAM par le Mahmood Lab pour le fichier model.py, notamment pour la Gated Attention et la Clustering-constrained branch, mais garde le data_loader.py et le train.py simples et adaptés à ma structure de dossiers locale.
-Le "Gated Attention" : C'est le cœur du modèle. Ne laissez pas l'IA coder une attention simple ; assurez-vous qu'elle utilise la version "Gated" du repo de Mahmood.
-L'échantillonnage des instances (Smooth Topk) : Pour la partie clustering, CLAM sélectionne intelligemment les tiles les plus et les moins représentatives. C'est cette partie mathématique qui fait la force du modèle
-L'optimiseur : Ils utilisent souvent des hyperparamètres très spécifiques (Learning rate à 2e−4, poids de la perte de clustering à 0.7× la perte totale)
+Objectif :
+Compléter un repository PyTorch existant pour entraîner et inférer
+un modèle CLAM (Clustering-constrained Attention MIL) afin de classifier
+des patients DLBCL en répondeur (0) ou progresseur (1) à la chimiothérapie,
+à partir de tiles HES issues de WSI.
 
-Lors de l'extraction des caractéristiques dans extract_features.py, crée un fichier de métadonnées (par exemple un .pt ou .h5) qui contient deux choses :
-    1. Le tenseur des features (les vecteurs du ViT).
-    2. Une liste de coordonnées ou d'index correspondant à l'ordre des fichiers traités.
-Même si les coordonnées exactes ne sont pas dans le nom du fichier, l'agent doit maintenir l'ordre des tiles afin que infer.py puisse reconstruire une grille cohérente (par exemple en supposant une lecture ligne par ligne si create_tiles.py a suivi cet ordre)."
+Contraintes NON négociables :
 
+- Le modèle DOIT implémenter le CLAM avec :
+  - Gated Attention EXACTEMENT comme dans le repo officiel du Mahmood Lab
+  - Branche Clustering-constrained avec Smooth Top-k sampling
+- L’optimiseur DOIT utiliser :
+  - Learning rate = 2e-4
+  - Poids de la perte de clustering = 0.7 × perte totale
+- Le framework DOIT être PyTorch
+- L’implémentation NE DOIT PAS simplifier l’attention
+- L’architecture des fichiers DOIT être conservée
+- Le script doit générer et sauvegarder un fichier splits.json (ou csv) contenant les IDs des patients pour chaque set, afin que infer.py charge strictement le test set.
 
-Assure-toi que le data_loader.py renvoie non seulement les features, mais aussi l'identifiant (nom de la tile) pour que je puisse mapper les scores d'attention aux images originales dans le script de visualisation.
+Structure du repository (à respecter strictement) :
 
+/src
+  ├── extract_features.py
+  ├── data_loader.py
+  ├── model.py
+train.py
+infer.py
+/dataset_tiles/
+/dataset
+clinical_data.csv
 
-Je veux que le scripte infer.py crée une heatmap reconstituant la WSI originale avec des scores d’’attention. 
+Données :
+- dataset/
+  - contient les WSI des patients nommés selon le patient_id (exemple : patient_id.png)
+  - WSI brutes (ne pas traiter ici, on suppose que les tiles sont faites).
+- dataset_tiles/
+  - Chaque sous-dossier = 1 patient = 1 WSI
+  - Contient des tiles PNG 256×256
+  - le nom des tiles correspond à leurs coordonées y_x (exemple : 0_245.png)
+- clinical_data.csv :
+  - patient_id = nom du dossier patient
+  - status = label slide-level (0 répondeur, 1 progresseur)
+- Les tiles ne sont PAS labellisées individuellement
+- Les features ne sont PAS encore extraites
 
+Attentes par script :
+
+extract_features.py :
+- Extraire des features (ex: Resnet50)
+- Appliquer la normalisation Mean/Std ImageNet sur les tiles.
+- Sauvegarder un fichier .pt ou .h5 contenant :
+- Doit parser les noms de fichiers y_x.png pour extraire les coordonnées. Sauvegarder un fichier .pt par patient contenant un dictionnaire : {'features': tensor, 'coords': tensor}.
+
+data_loader.py :
+- Gérer le split train/val/test avec un random seed fixe
+- Ne doit charger QUE les fichiers .pt (features) pour l'entraînement afin d'optimiser la RAM. Gérer un split stratifié par patient.
+- collate_fn : Doit gérer des tailles de bags variables (batch size = 1 est acceptable pour simplifier, sinon padding)
+- Retourner :
+  - features
+  - label slide-level
+  - identifiants des tiles (nom de fichier)
+- Permettre à infer.py de charger EXACTEMENT le même split
+
+model.py :
+- Inspiré STRICTEMENT du CLAM officiel
+- Instance Clustering : Implémenter le "Smooth SVM loss" sur les top-k instances. Fixer n_classes=2 et subclustering_classes=10 (par défaut).
+- Inclure :
+  - Gated Attention
+  - Smooth Top-k instance sampling
+  - Clustering loss
+
+train.py :
+- Entraîner le modèle
+- Boucle d'entraînement gérant la double perte.
+- Sauvegarder le meilleur modèle selon l'AUC de validation.
+- Sauvegarder un model.pth
+
+infer.py :
+- Charger model.pth
+- Générer des scores d’attention
+- Reconstruire une heatmap WSI cohérente
+- Pour un patient donné, extraire les scores d'attention (A), les normaliser (Min-Max), et les re-mapper sur une matrice 2D en utilisant les coordonnées y_x
+
+Livrable attendu :
+
+- Code Python COMPLET pour chaque fichier
+- Pas de pseudo-code
+- Commentaires uniquement si nécessaires
+- Hypothèses clairement explicitées si une information manque
+
+Si une partie du CLAM officiel est complexe, implémente-la fidèlement
+plutôt que de la simplifier, même si le code est plus long.
