@@ -11,3 +11,24 @@ python train.py --clinical_csv clinical_data.csv --features_dir features --outpu
 # 3. Inférence et heatmaps
 python infer.py --results_dir results --features_dir features --output_dir inference_output
 ```
+
+## Création de l'environnement virtuel
+```bash
+module load python
+python3 -m venv venv
+source venv/bin/activate
+pip3 install --prefix=/work/imvia/in156281/clamv2/venv -r requirements.txt
+export PYTHONPATH=/work/imvia/in156281/clamv2/venv/lib/python3.9/site-packages:$PYTHONPATH
+pip3 list
+```
+## Alias 'venv'
+```bash
+mkdir -p /work/imvia/in156281/.cache/matplotlib
+mkdir -p /work/imvia/in156281/.cache/wandb
+mkdir -p /work/imvia/in156281/.config/wandb
+alias venv='module load python && source venv/bin/activate 
+                               && export PYTHONPATH=venv/lib/python3.9/site-packages:$PYTHONPATH
+                               && export MPLCONFIGDIR=/work/imvia/in156281/.cache/matplotlib
+                               && export WANDB_CACHE_DIR=/work/imvia/in156281/.cache/wandb 
+                               && export WANDB_CONFIG_DIR=/work/imvia/in156281/.config/wandb'
+```
