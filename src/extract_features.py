@@ -1,212 +1,266 @@
 """
-Feature extraction script for CLAM pipeline.
-Extracts features from tile images using ResNet50 pretrained on ImageNet.
-Saves .pt files containing features and coordinates for each patient.
+Feature extraction script for CLAM pipeline using Phikon.
+
+Phikon: Self-Supervised Vision Transformer for Pathology (Owkin)
+- Architecture: ViT-B/16 trained with DINOv2 on TCGA
+- Output dimension: 768
+- Input size: 224x224
+- Publicly available: https://huggingface.co/owkin/phikon
+
+Reference: Filiot et al., "Scaling Self-Supervised Learning for 
+Histopathology with Masked Image Modeling", MedRxiv 2023
 """
 
 import os
 import argparse
 import torch
 import torch.nn as nn
-from torchvision import models, transforms
+from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-import re
+
+try:
+    from transformers import AutoModel, AutoImageProcessor
+except ImportError:
+    raise ImportError(
+        "transformers is required for Phikon.\n"
+        "Install with: pip install transformers huggingface_hub"
+    )
 
 
-class ResNet50FeatureExtractor(nn.Module):
-    """ResNet50 truncated at the global average pooling layer for feature extraction."""
+class PhikonFeatureExtractor(nn.Module):
+    """
+    Phikon feature extractor for histopathology tiles.
+    Uses ViT-B/16 pretrained on TCGA with DINOv2.
+    """
     
-    def __init__(self):
-        super(ResNet50FeatureExtractor, self).__init__()
-        resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        # Remove the final FC layer, keep up to avgpool
-        self.features = nn.Sequential(*list(resnet.children())[:-1])
+    def __init__(self, device='cuda'):
+        super(PhikonFeatureExtractor, self).__init__()
+        
+        print("Loading Phikon model from HuggingFace (owkin/phikon)...")
+        
+        self.model = AutoModel.from_pretrained("owkin/phikon", trust_remote_code=True)
+        self.processor = AutoImageProcessor.from_pretrained("owkin/phikon", trust_remote_code=True)
+        self.model.eval()
+        self.model.to(device)
+        self.device = device
+        self.embed_dim = 768
+        
+        # Phikon transforms
+        self.transform = transforms.Compose([
+            transforms.Resize(224),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=self.processor.image_mean,
+                std=self.processor.image_std
+            )
+        ])
+        
+        print(f"Phikon loaded successfully. Embedding dimension: {self.embed_dim}")
         
     def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)  # Flatten to (batch_size, 2048)
-        return x
+        with torch.no_grad():
+            outputs = self.model(x)
+            # Use CLS token as global representation
+            features = outputs.last_hidden_state[:, 0, :]  # (B, 768)
+        return features
+    
+    def get_transform(self):
+        return self.transform
 
 
-def parse_tile_coords(filename):
+class TileDataset(torch.utils.data.Dataset):
+    """Dataset for loading tiles from a slide directory."""
+    
+    VALID_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
+    
+    def __init__(self, tiles_dir, transform=None):
+        self.tiles_dir = tiles_dir
+        self.transform = transform
+        
+        # Get all valid image files
+        self.tile_paths = []
+        for f in os.listdir(tiles_dir):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in self.VALID_EXTENSIONS:
+                self.tile_paths.append(os.path.join(tiles_dir, f))
+        
+        # Sort for reproducibility
+        self.tile_paths.sort()
+        
+    def __len__(self):
+        return len(self.tile_paths)
+    
+    def __getitem__(self, idx):
+        tile_path = self.tile_paths[idx]
+        try:
+            image = Image.open(tile_path).convert('RGB')
+            if self.transform:
+                image = self.transform(image)
+            return image, tile_path
+        except Exception as e:
+            print(f"Error loading {tile_path}: {e}")
+            # Return a blank image on error
+            if self.transform:
+                blank = Image.new('RGB', (224, 224), (255, 255, 255))
+                return self.transform(blank), tile_path
+            return None, tile_path
+
+
+def extract_features_for_slide(
+    model: PhikonFeatureExtractor,
+    tiles_dir: str,
+    output_path: str,
+    batch_size: int = 64,
+    num_workers: int = 4
+):
     """
-    Parse tile filename to extract y, x coordinates.
-    Expected format: y_x.png (e.g., 0_245.png)
-    """
-    basename = os.path.splitext(filename)[0]
-    match = re.match(r'^(\d+)_(\d+)$', basename)
-    if match:
-        y = int(match.group(1))
-        x = int(match.group(2))
-        return y, x
-    else:
-        raise ValueError(f"Cannot parse coordinates from filename: {filename}")
-
-
-def get_tile_transform():
-    """
-    Returns the ImageNet normalization transform for tiles.
-    """
-    return transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],  # ImageNet mean
-            std=[0.229, 0.224, 0.225]    # ImageNet std
-        )
-    ])
-
-
-def extract_features_for_patient(patient_dir, model, transform, device, batch_size=32):
-    """
-    Extract features for all tiles of a single patient.
+    Extract features for all tiles in a slide directory.
     
     Args:
-        patient_dir: Path to the patient's tile directory
-        model: Feature extraction model
-        transform: Image preprocessing transform
-        device: torch device
-        batch_size: Batch size for processing
-        
-    Returns:
-        features: Tensor of shape (N, 2048) where N is number of tiles
-        coords: Tensor of shape (N, 2) with (y, x) coordinates
-        tile_names: List of tile filenames
-    """
-    tile_files = [f for f in os.listdir(patient_dir) 
-                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
+        model: Phikon feature extractor
+        tiles_dir: Directory containing tile images
+        output_path: Path to save the .pt features file
+        batch_size: Batch size for inference
+        num_workers: Number of data loading workers
     
-    if len(tile_files) == 0:
-        return None, None, None
+    Returns:
+        Tensor of shape (num_tiles, 768)
+    """
+    dataset = TileDataset(tiles_dir, transform=model.get_transform())
+    
+    if len(dataset) == 0:
+        print(f"  Warning: No tiles found in {tiles_dir}")
+        return None
+    
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
+    )
     
     all_features = []
-    all_coords = []
-    tile_names = []
     
-    # Process in batches
-    images_batch = []
-    coords_batch = []
-    names_batch = []
-    
-    for tile_file in tile_files:
-        tile_path = os.path.join(patient_dir, tile_file)
-        
-        try:
-            # Parse coordinates from filename
-            y, x = parse_tile_coords(tile_file)
-            
-            # Load and transform image
-            img = Image.open(tile_path).convert('RGB')
-            img_tensor = transform(img)
-            
-            images_batch.append(img_tensor)
-            coords_batch.append([y, x])
-            names_batch.append(tile_file)
-            
-            # Process batch when full
-            if len(images_batch) >= batch_size:
-                batch_tensor = torch.stack(images_batch).to(device)
-                with torch.no_grad():
-                    batch_features = model(batch_tensor)
-                all_features.append(batch_features.cpu())
-                all_coords.extend(coords_batch)
-                tile_names.extend(names_batch)
-                
-                images_batch = []
-                coords_batch = []
-                names_batch = []
-                
-        except Exception as e:
-            print(f"Warning: Could not process {tile_file}: {e}")
-            continue
-    
-    # Process remaining tiles
-    if len(images_batch) > 0:
-        batch_tensor = torch.stack(images_batch).to(device)
-        with torch.no_grad():
-            batch_features = model(batch_tensor)
-        all_features.append(batch_features.cpu())
-        all_coords.extend(coords_batch)
-        tile_names.extend(names_batch)
-    
-    if len(all_features) == 0:
-        return None, None, None
+    for batch, _ in dataloader:
+        batch = batch.to(model.device)
+        features = model(batch)
+        all_features.append(features.cpu())
     
     # Concatenate all features
-    features = torch.cat(all_features, dim=0)
-    coords = torch.tensor(all_coords, dtype=torch.long)
+    features_tensor = torch.cat(all_features, dim=0)  # (N, 768)
     
-    return features, coords, tile_names
+    # Save features
+    torch.save(features_tensor, output_path)
+    
+    return features_tensor
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract features from tile images')
-    parser.add_argument('--tiles_dir', type=str, default='dataset_tiles',
-                        help='Directory containing patient tile folders')
-    parser.add_argument('--output_dir', type=str, default='features',
-                        help='Directory to save extracted features')
-    parser.add_argument('--batch_size', type=int, default=32,
-                        help='Batch size for feature extraction')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use (cuda or cpu)')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description='Extract Phikon features from histopathology tiles'
+    )
+    parser.add_argument(
+        '--tiles_dir', 
+        type=str, 
+        default='dataset_tiles',
+        help='Directory containing slide subdirectories with tiles'
+    )
+    parser.add_argument(
+        '--output_dir', 
+        type=str, 
+        default='features',
+        help='Directory to save extracted features'
+    )
+    parser.add_argument(
+        '--batch_size', 
+        type=int, 
+        default=64,
+        help='Batch size for feature extraction'
+    )
+    parser.add_argument(
+        '--num_workers', 
+        type=int, 
+        default=4,
+        help='Number of data loading workers'
+    )
+    parser.add_argument(
+        '--device', 
+        type=str, 
+        default='cuda' if torch.cuda.is_available() else 'cpu',
+        help='Device to use (cuda/cpu)'
+    )
     
-    # Setup device
-    if args.device == 'cuda' and torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        device = torch.device('cpu')
-        print("Using CPU")
+    args = parser.parse_args()
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Initialize model
-    print("Loading ResNet50 feature extractor...")
-    model = ResNet50FeatureExtractor()
-    model = model.to(device)
-    model.eval()
+    print("=" * 60)
+    print("PHIKON FEATURE EXTRACTION")
+    print("=" * 60)
+    print(f"Tiles directory: {args.tiles_dir}")
+    print(f"Output directory: {args.output_dir}")
+    print(f"Device: {args.device}")
+    print(f"Batch size: {args.batch_size}")
+    print("=" * 60)
     
-    # Get transform
-    transform = get_tile_transform()
+    # Load model
+    model = PhikonFeatureExtractor(device=args.device)
     
-    # Get list of patient directories
-    patient_dirs = [d for d in os.listdir(args.tiles_dir) 
-                    if os.path.isdir(os.path.join(args.tiles_dir, d))]
+    # Get all slide directories
+    slide_dirs = []
+    for name in os.listdir(args.tiles_dir):
+        slide_path = os.path.join(args.tiles_dir, name)
+        if os.path.isdir(slide_path):
+            slide_dirs.append((name, slide_path))
     
-    print(f"Found {len(patient_dirs)} patients")
+    slide_dirs.sort()
+    print(f"\nFound {len(slide_dirs)} slides to process")
     
-    # Process each patient
-    for patient_id in tqdm(patient_dirs, desc="Extracting features"):
-        patient_path = os.path.join(args.tiles_dir, patient_id)
-        output_path = os.path.join(args.output_dir, f"{patient_id}.pt")
+    # Process each slide
+    success_count = 0
+    error_count = 0
+    
+    for slide_id, slide_path in tqdm(slide_dirs, desc="Extracting features"):
+        output_path = os.path.join(args.output_dir, f"{slide_id}.pt")
         
         # Skip if already processed
         if os.path.exists(output_path):
+            tqdm.write(f"  Skipping {slide_id} (already exists)")
+            success_count += 1
             continue
         
-        # Extract features
-        features, coords, tile_names = extract_features_for_patient(
-            patient_path, model, transform, device, args.batch_size
-        )
-        
-        if features is None:
-            print(f"Warning: No valid tiles for patient {patient_id}")
-            continue
-        
-        # Save as .pt file with dictionary structure
-        save_dict = {
-            'features': features,      # Shape: (N, 2048)
-            'coords': coords,          # Shape: (N, 2) - (y, x)
-            'tile_names': tile_names   # List of filenames
-        }
-        
-        torch.save(save_dict, output_path)
+        try:
+            features = extract_features_for_slide(
+                model=model,
+                tiles_dir=slide_path,
+                output_path=output_path,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers
+            )
+            
+            if features is not None:
+                tqdm.write(f"  {slide_id}: {features.shape[0]} tiles -> {output_path}")
+                success_count += 1
+            else:
+                error_count += 1
+                
+        except Exception as e:
+            tqdm.write(f"  Error processing {slide_id}: {e}")
+            error_count += 1
     
-    print(f"\nFeature extraction complete. Files saved to {args.output_dir}/")
-    print(f"Feature dimension: 2048 (ResNet50)")
+    print("\n" + "=" * 60)
+    print("EXTRACTION COMPLETE")
+    print("=" * 60)
+    print(f"Successfully processed: {success_count} slides")
+    print(f"Errors: {error_count} slides")
+    print(f"Feature dimension: 768")
+    print(f"Features saved to: {args.output_dir}")
+    print("\nNext step: Update train.sh with --embed_dim 768")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
