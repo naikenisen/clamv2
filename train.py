@@ -12,8 +12,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LambdaLR
 from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 
 # Add src to path
@@ -360,6 +361,10 @@ def main():
                         help='Bag-level loss function')
     parser.add_argument('--inst_loss', type=str, choices=['ce', 'svm'], default='svm',
                         help='Instance-level loss function')
+    parser.add_argument('--use_class_weights', action='store_true', default=True,
+                        help='Use class weights to handle imbalanced data')
+    parser.add_argument('--label_smoothing', type=float, default=0.1,
+                        help='Label smoothing factor (0 = no smoothing)')
     
     # Data split
     parser.add_argument('--test_size', type=float, default=0.15,
@@ -384,6 +389,8 @@ def main():
                         default='cosine', help='Learning rate scheduler')
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='Minimum learning rate for scheduler')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='Number of warmup epochs (gradual LR increase)')
     
     # Other
     parser.add_argument('--num_workers', type=int, default=4,
@@ -444,12 +451,36 @@ def main():
         random_seed=args.seed
     )
     
+    # Compute class weights from training data for handling class imbalance
+    train_labels = []
+    for batch in train_loader:
+        train_labels.append(batch['label'].item())
+    train_labels = np.array(train_labels)
+    
+    class_counts = np.bincount(train_labels)
+    print(f"\nClass distribution in training set:")
+    for i, count in enumerate(class_counts):
+        print(f"  Class {i}: {count} samples ({100*count/len(train_labels):.1f}%)")
+    
+    # Compute balanced class weights
+    if args.use_class_weights:
+        class_weights = compute_class_weight('balanced', classes=np.unique(train_labels), y=train_labels)
+        class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+        print(f"  Class weights: {class_weights.cpu().numpy()}")
+    else:
+        class_weights = None
+    
     # Initialize loss functions
     print("\nInitializing loss functions...")
     if args.bag_loss == 'svm':
         bag_loss_fn = SmoothTop1SVM(n_classes=args.n_classes)
     else:
-        bag_loss_fn = nn.CrossEntropyLoss()
+        # Use class weights and label smoothing for CrossEntropy
+        bag_loss_fn = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=args.label_smoothing
+        )
+        print(f"  Using CrossEntropyLoss with label_smoothing={args.label_smoothing}")
     
     if args.inst_loss == 'svm':
         instance_loss_fn = SmoothTop1SVM(n_classes=2)
@@ -495,17 +526,33 @@ def main():
     # Initialize optimizer
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
-    # Initialize learning rate scheduler
+    # Warmup + main scheduler
+    def warmup_lambda(epoch):
+        """Linear warmup for first warmup_epochs, then return 1.0."""
+        if epoch < args.warmup_epochs:
+            return (epoch + 1) / args.warmup_epochs
+        return 1.0
+    
+    warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    
+    # Initialize main learning rate scheduler
     if args.scheduler == 'cosine':
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.max_epochs, eta_min=args.min_lr)
-        print(f"Using CosineAnnealingLR scheduler (T_max={args.max_epochs}, min_lr={args.min_lr})")
+        # Cosine annealing after warmup
+        main_scheduler = CosineAnnealingLR(
+            optimizer, 
+            T_max=args.max_epochs - args.warmup_epochs, 
+            eta_min=args.min_lr
+        )
+        print(f"Using CosineAnnealingLR scheduler (T_max={args.max_epochs - args.warmup_epochs}, min_lr={args.min_lr})")
     elif args.scheduler == 'plateau':
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, 
+        main_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, 
                                        min_lr=args.min_lr, verbose=True)
         print(f"Using ReduceLROnPlateau scheduler")
     else:
-        scheduler = None
-        print("No learning rate scheduler")
+        main_scheduler = None
+        print("No main learning rate scheduler")
+    
+    print(f"Warmup: {args.warmup_epochs} epochs")
     
     # Initialize early stopping
     if args.early_stopping:
@@ -540,8 +587,10 @@ def main():
     
     for epoch in range(args.max_epochs):
         current_lr = optimizer.param_groups[0]['lr']
+        is_warmup = epoch < args.warmup_epochs
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1}/{args.max_epochs} | LR: {current_lr:.6f}")
+        print(f"Epoch {epoch+1}/{args.max_epochs} | LR: {current_lr:.6f}" + 
+              (" [WARMUP]" if is_warmup else ""))
         print('='*60)
         
         # Training with gradient clipping
@@ -557,11 +606,15 @@ def main():
         )
         
         # Update learning rate scheduler
-        if scheduler is not None:
-            if isinstance(scheduler, ReduceLROnPlateau):
-                scheduler.step(val_loss)
+        if is_warmup:
+            # During warmup, use warmup scheduler
+            warmup_scheduler.step()
+        elif main_scheduler is not None:
+            # After warmup, use main scheduler
+            if isinstance(main_scheduler, ReduceLROnPlateau):
+                main_scheduler.step(val_loss)
             else:
-                scheduler.step()
+                main_scheduler.step()
         
         # Log history
         training_history['train_loss'].append(train_loss)

@@ -2,7 +2,7 @@
 #$ -q gpu
 #$ -o result.out
 #$ -j y
-#$ -N clamv2v1
+#$ -N clamv2v2
 cd $WORKDIR
 cd /beegfs/data/work/imvia/in156281/clamv2
 source /beegfs/data/work/imvia/in156281/clamv2/venv/bin/activate
@@ -16,11 +16,15 @@ python /beegfs/data/work/imvia/in156281/clamv2/train.py\
     --model_type clam_sb \
     --model_size small \
     --dropout 0.5 \
-    --lr 0.0002 \
+    --lr 0.0001 \
     --bag_weight 0.7 \
     --weight_decay 1e-4 \
     --scheduler cosine \
     --es_mode loss \
-    --patience 15 \
+    --patience 20 \
     --max_grad_norm 1.0 \
-    --create_new_splits
+    --k_sample 12 \
+    --use_class_weights \
+    --label_smoothing 0.1 \
+    --warmup_epochs 5 \
+    --max_epochs 150
