@@ -32,3 +32,14 @@ alias venv='module load python && source venv/bin/activate
                                && export WANDB_CACHE_DIR=/work/imvia/in156281/.cache/wandb 
                                && export WANDB_CONFIG_DIR=/work/imvia/in156281/.config/wandb'
 ```
+
+# Résultats du modèle 
+Val Set: val_loss=0.5365, val_error=0.3077, auc=0.6863
+  Instance class 0 clustering acc: 0.6763, correct=211/312
+  Instance class 1 clustering acc: 0.6955, correct=217/312
+
+Test Results:
+  Loss: 0.5365
+  Error: 0.3077
+  AUC: 0.6863
+  Accuracy: 0.6923
