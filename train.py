@@ -20,7 +20,7 @@ from tqdm import tqdm
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM, initialize_weights, initialize_attention_weights
+from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM, FocalLoss, initialize_weights, initialize_attention_weights
 from src.data_loader import get_dataloaders
 
 
@@ -130,7 +130,7 @@ def calculate_error(Y_hat, Y):
 
 
 def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight, 
-                    loss_fn, device, verbose=True, max_grad_norm=1.0):
+                    loss_fn, device, verbose=True, max_grad_norm=1.0, bag_dropout=0.0):
     """
     Training loop for CLAM with instance-level clustering.
     
@@ -145,6 +145,7 @@ def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight,
         device: Training device
         verbose: Whether to print progress
         max_grad_norm: Maximum gradient norm for clipping
+        bag_dropout: Fraction of instances to randomly drop (MIL augmentation)
         
     Returns:
         train_loss, train_error, train_inst_loss
@@ -171,6 +172,13 @@ def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight,
         
         data = features.to(device)
         lbl = label.to(device)
+        
+        # Bag-level dropout (MIL augmentation): randomly drop instances
+        if bag_dropout > 0 and data.size(0) > 10:  # Only if enough instances
+            n_instances = data.size(0)
+            n_keep = max(10, int(n_instances * (1 - bag_dropout)))  # Keep at least 10
+            keep_indices = torch.randperm(n_instances)[:n_keep].sort()[0]
+            data = data[keep_indices]
         
         optimizer.zero_grad()
         
@@ -365,6 +373,12 @@ def main():
                         help='Use class weights to handle imbalanced data')
     parser.add_argument('--label_smoothing', type=float, default=0.1,
                         help='Label smoothing factor (0 = no smoothing)')
+    parser.add_argument('--use_focal_loss', action='store_true', default=False,
+                        help='Use Focal Loss instead of CrossEntropy for bag loss')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                        help='Focal loss gamma parameter (focusing strength)')
+    parser.add_argument('--bag_dropout', type=float, default=0.1,
+                        help='Randomly drop this fraction of instances during training (MIL augmentation)')
     
     # Data split
     parser.add_argument('--test_size', type=float, default=0.15,
@@ -474,6 +488,14 @@ def main():
     print("\nInitializing loss functions...")
     if args.bag_loss == 'svm':
         bag_loss_fn = SmoothTop1SVM(n_classes=args.n_classes)
+    elif args.use_focal_loss:
+        # Use Focal Loss for better handling of class imbalance
+        bag_loss_fn = FocalLoss(
+            alpha=class_weights,
+            gamma=args.focal_gamma,
+            label_smoothing=args.label_smoothing
+        )
+        print(f"  Using FocalLoss with gamma={args.focal_gamma}, label_smoothing={args.label_smoothing}")
     else:
         # Use class weights and label smoothing for CrossEntropy
         bag_loss_fn = nn.CrossEntropyLoss(
@@ -593,11 +615,12 @@ def main():
               (" [WARMUP]" if is_warmup else ""))
         print('='*60)
         
-        # Training with gradient clipping
+        # Training with gradient clipping and bag dropout
         train_loss, train_error, train_inst_loss = train_loop_clam(
             epoch, model, train_loader, optimizer, args.n_classes,
             args.bag_weight, bag_loss_fn, device, 
-            max_grad_norm=args.max_grad_norm
+            max_grad_norm=args.max_grad_norm,
+            bag_dropout=args.bag_dropout
         )
         
         # Validation

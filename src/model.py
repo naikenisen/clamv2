@@ -75,6 +75,74 @@ class SmoothTop1SVM(nn.Module):
         return losses.mean()
 
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for handling class imbalance.
+    Down-weights well-classified examples and focuses on hard examples.
+    
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    
+    Reference: Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017
+    """
+    
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.0):
+        """
+        Args:
+            alpha: Class weights (tensor of shape [n_classes]) or None for uniform
+            gamma: Focusing parameter. gamma=0 is equivalent to CE. gamma=2 is common.
+            reduction: 'mean', 'sum', or 'none'
+            label_smoothing: Label smoothing factor
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+    
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: Predictions of shape (N, n_classes)
+            targets: Ground truth labels of shape (N,)
+        """
+        n_classes = logits.size(-1)
+        
+        # Apply label smoothing
+        if self.label_smoothing > 0:
+            with torch.no_grad():
+                targets_smooth = torch.zeros_like(logits)
+                targets_smooth.fill_(self.label_smoothing / (n_classes - 1))
+                targets_smooth.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+        else:
+            targets_smooth = F.one_hot(targets, num_classes=n_classes).float()
+        
+        # Compute probabilities
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(log_probs)
+        
+        # Compute focal weight: (1 - p_t)^gamma
+        p_t = (probs * targets_smooth).sum(dim=-1)  # probability of true class
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Compute cross-entropy
+        ce_loss = -(targets_smooth * log_probs).sum(dim=-1)
+        
+        # Apply focal weight
+        focal_loss = focal_weight * ce_loss
+        
+        # Apply class weights (alpha)
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
 class Attn_Net(nn.Module):
     """
     Attention Network without Gating (2 fc layers).
