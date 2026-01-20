@@ -65,9 +65,18 @@ class CLAMDataset(Dataset):
         feature_path = os.path.join(self.features_dir, f"{patient_id}.pt")
         data = torch.load(feature_path, weights_only=False)
         
-        features = data['features']  # Shape: (N, feature_dim)
-        coords = data['coords']      # Shape: (N, 2)
-        tile_names = data.get('tile_names', [])
+        # Handle both new format (dict) and legacy format (tensor only)
+        if isinstance(data, dict):
+            features = data['features']  # Shape: (N, feature_dim)
+            coords = data['coords']      # Shape: (N, 2) in (x, y) pixel format
+            tile_names = data.get('tile_names', [])
+        else:
+            # Legacy format: data is just the features tensor
+            features = data
+            # Create dummy coordinates (will break heatmap generation)
+            coords = torch.zeros((features.shape[0], 2), dtype=torch.long)
+            tile_names = []
+            print(f"  Warning: {patient_id} uses legacy format without coordinates")
         
         # Get label
         label = self.labels[patient_id]

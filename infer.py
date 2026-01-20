@@ -138,38 +138,37 @@ def create_attention_heatmap(attention_scores, coords, tile_size=256,
     
     Args:
         attention_scores: Normalized attention scores (N,)
-        coords: Tile coordinates (N, 2) in (y, x) format
-        tile_size: Size of each tile (for full WSI reconstruction)
+        coords: Tile coordinates (N, 2) in (x, y) pixel format
+        tile_size: Size of each tile in pixels (for converting to tile indices)
         output_path: Optional path to save the heatmap
         colormap: Matplotlib colormap to use
         
     Returns:
         heatmap: 2D numpy array with attention values
-        (y_min, y_max, x_min, x_max): Bounding box of the heatmap
+        (x_min, x_max, y_min, y_max): Bounding box in pixel coordinates
     """
     if len(coords) == 0:
         return None, None
     
-    # Get coordinate bounds
-    y_coords = coords[:, 0]
-    x_coords = coords[:, 1]
+    # Coords are in (x, y) pixel format - convert to tile indices
+    x_coords = coords[:, 0] // tile_size
+    y_coords = coords[:, 1] // tile_size
     
-    y_min, y_max = y_coords.min(), y_coords.max()
     x_min, x_max = x_coords.min(), x_coords.max()
+    y_min, y_max = y_coords.min(), y_coords.max()
     
-    # Create grid (using tile indices, not pixel coordinates)
-    # Normalize coordinates to start from 0
-    y_normalized = y_coords - y_min
+    # Normalize tile indices to start from 0
     x_normalized = x_coords - x_min
+    y_normalized = y_coords - y_min
     
-    # Create heatmap matrix
-    height = y_max - y_min + 1
-    width = x_max - x_min + 1
+    # Create heatmap matrix (rows = y, cols = x)
+    height = int(y_max - y_min + 1)
+    width = int(x_max - x_min + 1)
     heatmap = np.zeros((height, width))
     
-    # Fill in attention values
-    for i, (y, x) in enumerate(zip(y_normalized, x_normalized)):
-        heatmap[y, x] = attention_scores[i]
+    # Fill in attention values (heatmap[row, col] = heatmap[y, x])
+    for i, (x, y) in enumerate(zip(x_normalized, y_normalized)):
+        heatmap[int(y), int(x)] = attention_scores[i]
     
     if output_path:
         # Create figure
@@ -198,8 +197,8 @@ def create_full_resolution_heatmap(attention_scores, coords, tile_size=256,
     
     Args:
         attention_scores: Normalized attention scores (N,)
-        coords: Tile coordinates (N, 2) in (y, x) format
-        tile_size: Size of each tile
+        coords: Tile coordinates (N, 2) in (x, y) pixel format
+        tile_size: Size of each tile in pixels
         output_path: Optional path to save the heatmap
         colormap: Matplotlib colormap
         background_color: Background color for empty tiles
@@ -210,20 +209,20 @@ def create_full_resolution_heatmap(attention_scores, coords, tile_size=256,
     if len(coords) == 0:
         return None
     
-    # Get coordinate bounds
-    y_coords = coords[:, 0]
-    x_coords = coords[:, 1]
+    # Coords are in (x, y) pixel format
+    x_coords = coords[:, 0]
+    y_coords = coords[:, 1]
     
-    y_min, y_max = y_coords.min(), y_coords.max()
     x_min, x_max = x_coords.min(), x_coords.max()
+    y_min, y_max = y_coords.min(), y_coords.max()
     
-    # Normalize coordinates
-    y_normalized = y_coords - y_min
+    # Normalize to start from 0
     x_normalized = x_coords - x_min
+    y_normalized = y_coords - y_min
     
-    # Calculate image size
-    height = (y_max - y_min + 1) * tile_size
-    width = (x_max - x_min + 1) * tile_size
+    # Calculate image size (in pixels)
+    width = int(x_max - x_min + tile_size)
+    height = int(y_max - y_min + tile_size)
     
     # Create RGBA image with background
     heatmap_img = Image.new('RGBA', (width, height), (*background_color, 255))
@@ -231,15 +230,15 @@ def create_full_resolution_heatmap(attention_scores, coords, tile_size=256,
     # Get colormap
     cmap = plt.cm.get_cmap(colormap)
     
-    # Fill in tiles
-    for i, (y, x) in enumerate(zip(y_normalized, x_normalized)):
+    # Fill in tiles at their actual pixel positions
+    for i, (x, y) in enumerate(zip(x_normalized, y_normalized)):
         # Get color for this attention score
         color = cmap(attention_scores[i])
         color_rgb = tuple(int(c * 255) for c in color[:3])
         
-        # Calculate pixel coordinates
-        py = y * tile_size
-        px = x * tile_size
+        # x, y are already in pixel coordinates (relative to min)
+        px = int(x)
+        py = int(y)
         
         # Create tile
         tile = Image.new('RGB', (tile_size, tile_size), color_rgb)
@@ -259,7 +258,7 @@ def overlay_heatmap_on_wsi(wsi_path, attention_scores, coords, tile_size=256,
     Args:
         wsi_path: Path to the WSI image
         attention_scores: Normalized attention scores
-        coords: Tile coordinates
+        coords: Tile coordinates (N, 2) in (x, y) pixel format
         tile_size: Size of each tile
         output_path: Path to save the overlay
         alpha: Transparency of the heatmap overlay
@@ -283,11 +282,11 @@ def overlay_heatmap_on_wsi(wsi_path, attention_scores, coords, tile_size=256,
     # Resize heatmap to match WSI size if needed
     heatmap = heatmap.convert('RGB')
     
-    # Calculate offset based on coordinate minimums
-    y_min = coords[:, 0].min()
-    x_min = coords[:, 1].min()
-    offset_y = y_min * tile_size
-    offset_x = x_min * tile_size
+    # Calculate offset based on coordinate minimums (coords are in x, y format)
+    x_min = int(coords[:, 0].min())
+    y_min = int(coords[:, 1].min())
+    offset_x = x_min  # Already in pixels
+    offset_y = y_min  # Already in pixels
     
     # Create overlay at full WSI size
     overlay = Image.new('RGB', (wsi_width, wsi_height), (255, 255, 255))
@@ -393,22 +392,35 @@ def run_inference(args):
             raise FileNotFoundError(f"Features not found for patient {args.patient_id}")
         
         data = torch.load(feature_path, weights_only=False)
-        features = data['features']
-        coords = data['coords']
-        tile_names = data.get('tile_names', [])
+        
+        # Handle both new format (dict) and legacy format (tensor only)
+        if isinstance(data, dict):
+            features = data['features']
+            coords = data['coords']
+            tile_names = data.get('tile_names', [])
+            tile_size = data.get('tile_size', 256)
+        else:
+            # Legacy format: data is just the features tensor
+            features = data
+            coords = torch.zeros((features.shape[0], 2), dtype=torch.long)
+            tile_names = []
+            tile_size = 256
+            print(f"  Warning: Using legacy format without coordinates. Heatmaps will not be spatially accurate.")
         
         print(f"Processing patient {args.patient_id}...")
+        print(f"  Features: {features.shape}, Coords: {coords.shape}, Tile size: {tile_size}px")
         result = infer_single_patient(model, features, coords, device, tile_names)
         
         print(f"\nPrediction: {result['prediction_label']}")
         print(f"Probabilities: Responder={result['probabilities'][0]:.4f}, "
               f"Progressor={result['probabilities'][1]:.4f}")
         
-        # Create heatmap
+        # Create heatmap (tile index grid)
         heatmap_path = os.path.join(args.output_dir, f"{args.patient_id}_heatmap.png")
         create_attention_heatmap(
             np.array(result['attention_normalized']),
             np.array(result['coords']),
+            tile_size=tile_size,
             output_path=heatmap_path
         )
         print(f"Heatmap saved to {heatmap_path}")
@@ -419,7 +431,7 @@ def run_inference(args):
             create_full_resolution_heatmap(
                 np.array(result['attention_normalized']),
                 np.array(result['coords']),
-                tile_size=256,
+                tile_size=tile_size,
                 output_path=full_heatmap_path
             )
             print(f"Full resolution heatmap saved to {full_heatmap_path}")
