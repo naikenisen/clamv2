@@ -15,6 +15,7 @@ python /beegfs/data/work/imvia/in156281/clamv2/train.py\
     --output_dir results \
     --model_type clam_sb \
     --model_size small \
+    --embed_dim 768 \
     --dropout 0.5 \
     --lr 0.0001 \
     --bag_weight 0.9 \
