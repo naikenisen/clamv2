@@ -82,19 +82,23 @@ class Attn_Net(nn.Module):
     Args:
         L: input feature dimension
         D: hidden layer dimension
-        dropout: whether to use dropout (p = 0.25)
+        dropout: dropout rate (float) or False to disable
         n_classes: number of classes (attention branches)
     """
     
-    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
+    def __init__(self, L=1024, D=256, dropout=0.25, n_classes=1):
         super(Attn_Net, self).__init__()
+        
+        # Store dropout rate
+        self.dropout_rate = dropout if isinstance(dropout, float) else 0.25
+        
         self.module = [
             nn.Linear(L, D),
             nn.Tanh()
         ]
         
         if dropout:
-            self.module.append(nn.Dropout(0.25))
+            self.module.append(nn.Dropout(self.dropout_rate))
         
         self.module.append(nn.Linear(D, n_classes))
         
@@ -116,12 +120,15 @@ class Attn_Net_Gated(nn.Module):
     Args:
         L: input feature dimension
         D: hidden layer dimension
-        dropout: whether to use dropout (p = 0.25)
+        dropout: dropout rate (float) or False to disable
         n_classes: number of classes (attention branches)
     """
     
-    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
+    def __init__(self, L=1024, D=256, dropout=0.25, n_classes=1):
         super(Attn_Net_Gated, self).__init__()
+        
+        # Store dropout rate for use in layers
+        self.dropout_rate = dropout if isinstance(dropout, float) else 0.25
         
         self.attention_a = [
             nn.Linear(L, D),
@@ -134,8 +141,8 @@ class Attn_Net_Gated(nn.Module):
         ]
         
         if dropout:
-            self.attention_a.append(nn.Dropout(0.25))
-            self.attention_b.append(nn.Dropout(0.25))
+            self.attention_a.append(nn.Dropout(self.dropout_rate))
+            self.attention_b.append(nn.Dropout(self.dropout_rate))
         
         self.attention_a = nn.Sequential(*self.attention_a)
         self.attention_b = nn.Sequential(*self.attention_b)
@@ -166,7 +173,7 @@ class CLAM_SB(nn.Module):
         embed_dim: input embedding dimension (2048 for ResNet50)
     """
     
-    def __init__(self, gate=True, size_arg="small", dropout=0.25, k_sample=8, 
+    def __init__(self, gate=True, size_arg="small", dropout=0.5, k_sample=8, 
                  n_classes=2, instance_loss_fn=None, subtyping=False, embed_dim=2048):
         super(CLAM_SB, self).__init__()
         
@@ -176,8 +183,13 @@ class CLAM_SB(nn.Module):
         }
         size = self.size_dict[size_arg]
         
-        # Feature compression: embed_dim -> 512
-        fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
+        # Feature compression: embed_dim -> 512 with LayerNorm for stability
+        fc = [
+            nn.Linear(size[0], size[1]), 
+            nn.LayerNorm(size[1]),  # Added LayerNorm for training stability
+            nn.ReLU(), 
+            nn.Dropout(dropout)
+        ]
         
         # Attention network
         if gate:
@@ -378,7 +390,7 @@ class CLAM_MB(CLAM_SB):
     Inherits from CLAM_SB and overrides the architecture for multi-branch attention.
     """
     
-    def __init__(self, gate=True, size_arg="small", dropout=0.25, k_sample=8,
+    def __init__(self, gate=True, size_arg="small", dropout=0.5, k_sample=8,
                  n_classes=2, instance_loss_fn=None, subtyping=False, embed_dim=2048):
         nn.Module.__init__(self)
         
@@ -388,8 +400,13 @@ class CLAM_MB(CLAM_SB):
         }
         size = self.size_dict[size_arg]
         
-        # Feature compression
-        fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
+        # Feature compression with LayerNorm for stability
+        fc = [
+            nn.Linear(size[0], size[1]), 
+            nn.LayerNorm(size[1]),  # Added LayerNorm for training stability
+            nn.ReLU(), 
+            nn.Dropout(dropout)
+        ]
         
         # Multi-branch attention (n_classes attention heads)
         if gate:
@@ -481,15 +498,37 @@ class CLAM_MB(CLAM_SB):
 
 
 def initialize_weights(module):
-    """Initialize network weights."""
+    """
+    Initialize network weights with appropriate strategies:
+    - Kaiming initialization for layers followed by ReLU
+    - Xavier initialization for attention layers (Tanh/Sigmoid)
+    - Small values for final classifier to prevent overconfident predictions
+    """
     for m in module.modules():
         if isinstance(m, nn.Linear):
-            nn.init.xavier_normal_(m.weight)
+            # Use Kaiming for hidden layers, Xavier for attention
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
-                m.bias.data.zero_()
+                nn.init.constant_(m.bias, 0.01)  # Small positive bias
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.BatchNorm1d):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
+
+
+def initialize_attention_weights(module):
+    """
+    Specific initialization for attention networks.
+    Uses Xavier for Tanh/Sigmoid activations.
+    """
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Linear):
+            if 'attention' in name or 'classifier' in name:
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
 
 if __name__ == '__main__':

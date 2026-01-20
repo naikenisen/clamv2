@@ -12,57 +12,91 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
 from tqdm import tqdm
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM, initialize_weights
+from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM, initialize_weights, initialize_attention_weights
 from src.data_loader import get_dataloaders
 
 
 class EarlyStopping:
-    """Early stops the training if validation AUC doesn't improve after a given patience."""
+    """
+    Early stops the training if validation loss doesn't improve after a given patience.
+    Uses exponential moving average to smooth noisy validation metrics.
+    """
     
-    def __init__(self, patience=20, stop_epoch=50, verbose=True):
+    def __init__(self, patience=20, stop_epoch=30, verbose=True, delta=0.001, 
+                 smoothing_factor=0.3, mode='min'):
         """
         Args:
             patience: How long to wait after last improvement
             stop_epoch: Minimum epochs before early stopping kicks in
             verbose: Print messages
+            delta: Minimum change to qualify as improvement
+            smoothing_factor: EMA smoothing factor (0 = no smoothing, 1 = full smoothing)
+            mode: 'min' for loss (lower is better), 'max' for AUC (higher is better)
         """
         self.patience = patience
         self.stop_epoch = stop_epoch
         self.verbose = verbose
+        self.delta = delta
+        self.smoothing_factor = smoothing_factor
+        self.mode = mode
+        
         self.counter = 0
         self.best_score = None
+        self.best_raw_score = None
         self.early_stop = False
+        self.ema_score = None
         
-    def __call__(self, epoch, val_auc, model, ckpt_path='model.pth'):
-        score = val_auc
+    def _smooth(self, score):
+        """Apply exponential moving average smoothing."""
+        if self.ema_score is None:
+            self.ema_score = score
+        else:
+            self.ema_score = self.smoothing_factor * self.ema_score + (1 - self.smoothing_factor) * score
+        return self.ema_score
+    
+    def _is_improvement(self, score, best):
+        """Check if score is an improvement over best."""
+        if self.mode == 'min':
+            return score < best - self.delta
+        else:  # mode == 'max'
+            return score > best + self.delta
+        
+    def __call__(self, epoch, score, model, ckpt_path='model.pth'):
+        # Apply smoothing
+        smoothed_score = self._smooth(score)
         
         if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(model, ckpt_path)
-        elif score <= self.best_score:
+            self.best_score = smoothed_score
+            self.best_raw_score = score
+            self.save_checkpoint(model, ckpt_path, score)
+        elif not self._is_improvement(smoothed_score, self.best_score):
             self.counter += 1
             if self.verbose:
-                print(f'EarlyStopping counter: {self.counter}/{self.patience}')
+                print(f'EarlyStopping counter: {self.counter}/{self.patience} '
+                      f'(smoothed: {smoothed_score:.4f}, best: {self.best_score:.4f})')
             if self.counter >= self.patience and epoch >= self.stop_epoch:
                 self.early_stop = True
         else:
-            self.best_score = score
-            self.save_checkpoint(model, ckpt_path)
+            self.best_score = smoothed_score
+            self.best_raw_score = score
+            self.save_checkpoint(model, ckpt_path, score)
             self.counter = 0
         
         return self.early_stop
     
-    def save_checkpoint(self, model, ckpt_path):
-        """Save model when validation AUC improves."""
+    def save_checkpoint(self, model, ckpt_path, score):
+        """Save model when validation metric improves."""
         torch.save(model.state_dict(), ckpt_path)
         if self.verbose:
-            print(f'Saved best model with AUC: {self.best_score:.4f}')
+            metric_name = 'loss' if self.mode == 'min' else 'AUC'
+            print(f'Saved best model with val_{metric_name}: {score:.4f}')
 
 
 class AccuracyLogger:
@@ -95,7 +129,7 @@ def calculate_error(Y_hat, Y):
 
 
 def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight, 
-                    loss_fn, device, verbose=True):
+                    loss_fn, device, verbose=True, max_grad_norm=1.0):
     """
     Training loop for CLAM with instance-level clustering.
     
@@ -109,6 +143,7 @@ def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight,
         loss_fn: Bag-level loss function
         device: Training device
         verbose: Whether to print progress
+        max_grad_norm: Maximum gradient norm for clipping
         
     Returns:
         train_loss, train_error, train_inst_loss
@@ -175,6 +210,10 @@ def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight,
         
         # Backward pass
         total_loss.backward()
+        
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        
         optimizer.step()
     
     # Calculate epoch statistics
@@ -296,8 +335,8 @@ def main():
                         help='Feature embedding dimension (2048 for ResNet50)')
     parser.add_argument('--n_classes', type=int, default=2,
                         help='Number of classes')
-    parser.add_argument('--dropout', type=float, default=0.25,
-                        help='Dropout rate')
+    parser.add_argument('--dropout', type=float, default=0.5,
+                        help='Dropout rate (0.5 recommended for small datasets)')
     parser.add_argument('--k_sample', type=int, default=8,
                         help='Number of positive/negative patches to sample for clustering')
     
@@ -306,10 +345,15 @@ def main():
                         help='Maximum number of epochs')
     parser.add_argument('--lr', type=float, default=2e-4,
                         help='Learning rate')
-    parser.add_argument('--bag_weight', type=float, default=0.3,
-                        help='Weight for bag loss (clustering weight = 1 - bag_weight)')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                        help='Weight decay for optimizer')
+    parser.add_argument('--bag_weight', type=float, default=0.7,
+                        help='Weight for bag loss (clustering weight = 1 - bag_weight). '
+                             'Higher values focus more on slide-level classification.')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='Weight decay for optimizer (L2 regularization)')
+    
+    # Gradient clipping
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                        help='Maximum gradient norm for clipping')
     
     # Loss functions
     parser.add_argument('--bag_loss', type=str, choices=['ce', 'svm'], default='ce',
@@ -330,8 +374,16 @@ def main():
     # Early stopping
     parser.add_argument('--early_stopping', action='store_true', default=True,
                         help='Enable early stopping')
-    parser.add_argument('--patience', type=int, default=20,
+    parser.add_argument('--patience', type=int, default=15,
                         help='Early stopping patience')
+    parser.add_argument('--es_mode', type=str, choices=['loss', 'auc'], default='loss',
+                        help='Early stopping mode: loss (recommended) or auc')
+    
+    # Learning rate scheduler
+    parser.add_argument('--scheduler', type=str, choices=['cosine', 'plateau', 'none'], 
+                        default='cosine', help='Learning rate scheduler')
+    parser.add_argument('--min_lr', type=float, default=1e-6,
+                        help='Minimum learning rate for scheduler')
     
     # Other
     parser.add_argument('--num_workers', type=int, default=4,
@@ -367,10 +419,16 @@ def main():
     print("CLAM Training Configuration")
     print("="*60)
     print(f"Model type: {args.model_type}")
+    print(f"Model size: {args.model_size}")
+    print(f"Dropout: {args.dropout}")
     print(f"Learning rate: {args.lr}")
+    print(f"Weight decay: {args.weight_decay}")
     print(f"Bag weight: {args.bag_weight} (Clustering weight: {1-args.bag_weight})")
     print(f"K sample: {args.k_sample}")
     print(f"Instance loss: {args.inst_loss}")
+    print(f"Scheduler: {args.scheduler}")
+    print(f"Early stopping: {args.es_mode} (patience={args.patience})")
+    print(f"Gradient clipping: max_norm={args.max_grad_norm}")
     print("="*60 + "\n")
     
     # Load data
@@ -419,8 +477,13 @@ def main():
     else:
         model = CLAM_MB(**model_dict)
     
-    # Initialize weights
+    # Initialize weights with appropriate strategies
     model.apply(initialize_weights)
+    # Additional attention-specific initialization
+    initialize_attention_weights(model.attention_net)
+    for classifier in model.instance_classifiers:
+        initialize_attention_weights(classifier)
+    
     model = model.to(device)
     
     # Print model summary
@@ -432,9 +495,30 @@ def main():
     # Initialize optimizer
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
+    # Initialize learning rate scheduler
+    if args.scheduler == 'cosine':
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.max_epochs, eta_min=args.min_lr)
+        print(f"Using CosineAnnealingLR scheduler (T_max={args.max_epochs}, min_lr={args.min_lr})")
+    elif args.scheduler == 'plateau':
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, 
+                                       min_lr=args.min_lr, verbose=True)
+        print(f"Using ReduceLROnPlateau scheduler")
+    else:
+        scheduler = None
+        print("No learning rate scheduler")
+    
     # Initialize early stopping
     if args.early_stopping:
-        early_stopping = EarlyStopping(patience=args.patience, stop_epoch=50, verbose=True)
+        es_mode = 'min' if args.es_mode == 'loss' else 'max'
+        early_stopping = EarlyStopping(
+            patience=args.patience, 
+            stop_epoch=30,  # Reduced from 50 for faster experimentation
+            verbose=True,
+            delta=0.001,
+            smoothing_factor=0.3,
+            mode=es_mode
+        )
+        print(f"Early stopping enabled: mode={args.es_mode}, patience={args.patience}")
     else:
         early_stopping = None
     
@@ -450,24 +534,34 @@ def main():
         'val_loss': [],
         'val_error': [],
         'val_auc': [],
-        'val_inst_loss': []
+        'val_inst_loss': [],
+        'learning_rate': []
     }
     
     for epoch in range(args.max_epochs):
+        current_lr = optimizer.param_groups[0]['lr']
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1}/{args.max_epochs}")
+        print(f"Epoch {epoch+1}/{args.max_epochs} | LR: {current_lr:.6f}")
         print('='*60)
         
-        # Training
+        # Training with gradient clipping
         train_loss, train_error, train_inst_loss = train_loop_clam(
             epoch, model, train_loader, optimizer, args.n_classes,
-            args.bag_weight, bag_loss_fn, device
+            args.bag_weight, bag_loss_fn, device, 
+            max_grad_norm=args.max_grad_norm
         )
         
         # Validation
         val_loss, val_error, val_auc, val_inst_loss = validate_clam(
             epoch, model, val_loader, args.n_classes, bag_loss_fn, device
         )
+        
+        # Update learning rate scheduler
+        if scheduler is not None:
+            if isinstance(scheduler, ReduceLROnPlateau):
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
         
         # Log history
         training_history['train_loss'].append(train_loss)
@@ -477,10 +571,13 @@ def main():
         training_history['val_error'].append(val_error)
         training_history['val_auc'].append(val_auc)
         training_history['val_inst_loss'].append(val_inst_loss)
+        training_history['learning_rate'].append(current_lr)
         
         # Save best model and check early stopping
         if early_stopping:
-            stop = early_stopping(epoch, val_auc, model, model_path)
+            # Use val_loss for 'loss' mode, val_auc for 'auc' mode
+            es_metric = val_loss if args.es_mode == 'loss' else val_auc
+            stop = early_stopping(epoch, es_metric, model, model_path)
             if stop:
                 print(f"\nEarly stopping at epoch {epoch+1}")
                 break
@@ -513,12 +610,24 @@ def main():
     print(f"  Accuracy: {1 - test_error:.4f}")
     
     # Save final results
+    # Get best validation score based on early stopping mode
+    if early_stopping:
+        best_val_metric = early_stopping.best_raw_score
+        best_val_metric_name = 'best_val_loss' if args.es_mode == 'loss' else 'best_val_auc'
+    else:
+        best_val_metric = best_auc
+        best_val_metric_name = 'best_val_auc'
+    
+    # Also compute best val AUC from history for reference
+    best_val_auc_from_history = max(training_history['val_auc']) if training_history['val_auc'] else 0.0
+    
     final_results = {
         'test_loss': test_loss,
         'test_error': test_error,
         'test_auc': test_auc,
         'test_accuracy': 1 - test_error,
-        'best_val_auc': early_stopping.best_score if early_stopping else best_auc
+        best_val_metric_name: best_val_metric,
+        'best_val_auc': best_val_auc_from_history
     }
     
     with open(os.path.join(args.output_dir, 'final_results.json'), 'w') as f:
