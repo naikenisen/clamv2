@@ -1,7 +1,6 @@
 """
-Training script for CLAM model.
-Implements the dual-loss training loop with bag-level and instance-level clustering losses.
-Saves the best model based on validation AUC.
+Grid Search with Cross-Validation for CLAM hyperparameters.
+Tests multiple bag_weight values and other hyperparameters to find optimal configuration.
 """
 
 import os
@@ -12,258 +11,119 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LambdaLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import StratifiedKFold
 from tqdm import tqdm
+import pandas as pd
+from copy import deepcopy
+from itertools import product
+from datetime import datetime
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM, FocalLoss, initialize_weights, initialize_attention_weights
-from src.data_loader import get_dataloaders
+from src.data_loader import CLAMDataset, collate_fn
+from torch.utils.data import DataLoader
 
 
 class EarlyStopping:
-    """
-    Early stops the training if validation loss doesn't improve after a given patience.
-    Uses exponential moving average to smooth noisy validation metrics.
-    """
+    """Early stops the training if validation loss doesn't improve."""
     
-    def __init__(self, patience=20, stop_epoch=30, verbose=True, delta=0.001, 
-                 smoothing_factor=0.3, mode='min'):
-        """
-        Args:
-            patience: How long to wait after last improvement
-            stop_epoch: Minimum epochs before early stopping kicks in
-            verbose: Print messages
-            delta: Minimum change to qualify as improvement
-            smoothing_factor: EMA smoothing factor (0 = no smoothing, 1 = full smoothing)
-            mode: 'min' for loss (lower is better), 'max' for AUC (higher is better)
-        """
+    def __init__(self, patience=15, stop_epoch=20, mode='min'):
         self.patience = patience
         self.stop_epoch = stop_epoch
-        self.verbose = verbose
-        self.delta = delta
-        self.smoothing_factor = smoothing_factor
         self.mode = mode
-        
         self.counter = 0
         self.best_score = None
-        self.best_raw_score = None
+        self.best_model_state = None
         self.early_stop = False
-        self.ema_score = None
         
-    def _smooth(self, score):
-        """Apply exponential moving average smoothing."""
-        if self.ema_score is None:
-            self.ema_score = score
-        else:
-            self.ema_score = self.smoothing_factor * self.ema_score + (1 - self.smoothing_factor) * score
-        return self.ema_score
-    
-    def _is_improvement(self, score, best):
-        """Check if score is an improvement over best."""
-        if self.mode == 'min':
-            return score < best - self.delta
-        else:  # mode == 'max'
-            return score > best + self.delta
-        
-    def __call__(self, epoch, score, model, ckpt_path='model.pth'):
-        # Apply smoothing
-        smoothed_score = self._smooth(score)
-        
+    def __call__(self, epoch, score, model):
         if self.best_score is None:
-            self.best_score = smoothed_score
-            self.best_raw_score = score
-            self.save_checkpoint(model, ckpt_path, score)
-        elif not self._is_improvement(smoothed_score, self.best_score):
-            self.counter += 1
-            if self.verbose:
-                print(f'EarlyStopping counter: {self.counter}/{self.patience} '
-                      f'(smoothed: {smoothed_score:.4f}, best: {self.best_score:.4f})')
-            if self.counter >= self.patience and epoch >= self.stop_epoch:
-                self.early_stop = True
+            self.best_score = score
+            self.best_model_state = deepcopy(model.state_dict())
         else:
-            self.best_score = smoothed_score
-            self.best_raw_score = score
-            self.save_checkpoint(model, ckpt_path, score)
-            self.counter = 0
-        
+            is_better = (score < self.best_score) if self.mode == 'min' else (score > self.best_score)
+            if is_better:
+                self.best_score = score
+                self.best_model_state = deepcopy(model.state_dict())
+                self.counter = 0
+            else:
+                self.counter += 1
+                if self.counter >= self.patience and epoch >= self.stop_epoch:
+                    self.early_stop = True
         return self.early_stop
+
+
+def get_patients_and_labels(clinical_csv, features_dir):
+    """Get all patients with features and their labels."""
+    df = pd.read_csv(clinical_csv)
+    id_col = df.columns[0]
     
-    def save_checkpoint(self, model, ckpt_path, score):
-        """Save model when validation metric improves."""
-        torch.save(model.state_dict(), ckpt_path)
-        if self.verbose:
-            metric_name = 'loss' if self.mode == 'min' else 'AUC'
-            print(f'Saved best model with val_{metric_name}: {score:.4f}')
-
-
-class AccuracyLogger:
-    """Logger for tracking accuracy per class."""
+    all_patients = []
+    all_labels = []
     
-    def __init__(self, n_classes):
-        self.n_classes = n_classes
-        self.correct = {i: 0 for i in range(n_classes)}
-        self.count = {i: 0 for i in range(n_classes)}
+    for _, row in df.iterrows():
+        if pd.isna(row[id_col]) or pd.isna(row['status']):
+            continue
+        pid = str(int(row[id_col]))
+        feature_path = os.path.join(features_dir, f"{pid}.pt")
+        if os.path.exists(feature_path):
+            all_patients.append(pid)
+            all_labels.append(int(row['status']))
     
-    def log(self, Y_hat, Y):
-        Y_hat = int(Y_hat.item())
-        Y = int(Y.item())
-        self.count[Y] += 1
-        if Y_hat == Y:
-            self.correct[Y] += 1
-    
-    def get_summary(self, c):
-        count = self.count[c]
-        correct = self.correct[c]
-        if count == 0:
-            return None, 0, 0
-        acc = correct / count
-        return acc, correct, count
+    return np.array(all_patients), np.array(all_labels), df
 
 
-def calculate_error(Y_hat, Y):
-    """Calculate prediction error."""
-    return 1.0 if Y_hat.item() != Y.item() else 0.0
-
-
-def train_loop_clam(epoch, model, loader, optimizer, n_classes, bag_weight, 
-                    loss_fn, device, verbose=True, max_grad_norm=1.0, bag_dropout=0.0):
-    """
-    Training loop for CLAM with instance-level clustering.
-    
-    Args:
-        epoch: Current epoch number
-        model: CLAM model
-        loader: Training data loader
-        optimizer: Optimizer
-        n_classes: Number of classes
-        bag_weight: Weight for bag-level loss (instance weight = 1 - bag_weight)
-        loss_fn: Bag-level loss function
-        device: Training device
-        verbose: Whether to print progress
-        max_grad_norm: Maximum gradient norm for clipping
-        bag_dropout: Fraction of instances to randomly drop (MIL augmentation)
-        
-    Returns:
-        train_loss, train_error, train_inst_loss
-    """
+def train_epoch(model, loader, optimizer, bag_weight, loss_fn, device, max_grad_norm=1.0, bag_dropout=0.0):
+    """Train for one epoch."""
     model.train()
-    acc_logger = AccuracyLogger(n_classes=n_classes)
-    inst_logger = AccuracyLogger(n_classes=2)  # Instance classification is binary
+    total_loss = 0.0
     
-    train_loss = 0.0
-    train_error = 0.0
-    train_inst_loss = 0.0
-    inst_count = 0
-    
-    for batch_idx, batch in enumerate(loader):
-        # Get data
+    for batch in loader:
         features = batch['features']
         label = batch['label']
         
-        # Handle batch_size > 1 case (features is a list)
         if isinstance(features, list):
-            # Process first sample only (batch_size=1 is recommended for CLAM)
             features = features[0]
             label = label[0:1]
         
         data = features.to(device)
         lbl = label.to(device)
         
-        # Bag-level dropout (MIL augmentation): randomly drop instances
-        if bag_dropout > 0 and data.size(0) > 10:  # Only if enough instances
-            n_instances = data.size(0)
-            n_keep = max(10, int(n_instances * (1 - bag_dropout)))  # Keep at least 10
-            keep_indices = torch.randperm(n_instances)[:n_keep].sort()[0]
-            data = data[keep_indices]
+        # Bag dropout
+        if bag_dropout > 0 and data.size(0) > 10:
+            n_keep = max(10, int(data.size(0) * (1 - bag_dropout)))
+            keep_idx = torch.randperm(data.size(0))[:n_keep].sort()[0]
+            data = data[keep_idx]
         
         optimizer.zero_grad()
+        logits, _, _, _, instance_dict = model(data, label=lbl, instance_eval=True)
         
-        # Forward pass with instance evaluation
-        logits, Y_prob, Y_hat, _, instance_dict = model(data, label=lbl, instance_eval=True)
-        
-        acc_logger.log(Y_hat, lbl)
-        
-        # Bag-level loss
         bag_loss = loss_fn(logits, lbl)
-        loss_value = bag_loss.item()
-        
-        # Instance-level loss
         instance_loss = instance_dict['instance_loss']
-        inst_count += 1
-        instance_loss_value = instance_loss.item()
-        train_inst_loss += instance_loss_value
+        total = bag_weight * bag_loss + (1 - bag_weight) * instance_loss
         
-        # Combined loss: bag_weight * bag_loss + (1 - bag_weight) * instance_loss
-        total_loss = bag_weight * bag_loss + (1 - bag_weight) * instance_loss
-        
-        # Log instance predictions
-        inst_preds = instance_dict['inst_preds']
-        inst_labels = instance_dict['inst_labels']
-        for p, t in zip(inst_preds, inst_labels):
-            inst_logger.log(torch.tensor([p]), torch.tensor([t]))
-        
-        train_loss += loss_value
-        
-        if verbose and (batch_idx + 1) % 20 == 0:
-            print(f'  Batch {batch_idx+1}, loss: {loss_value:.4f}, '
-                  f'instance_loss: {instance_loss_value:.4f}, '
-                  f'total_loss: {total_loss.item():.4f}, '
-                  f'label: {lbl.item()}, bag_size: {data.size(0)}')
-        
-        error = calculate_error(Y_hat, lbl)
-        train_error += error
-        
-        # Backward pass
-        total_loss.backward()
-        
-        # Gradient clipping to prevent exploding gradients
+        total_loss += bag_loss.item()
+        total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-        
         optimizer.step()
     
-    # Calculate epoch statistics
-    train_loss /= len(loader)
-    train_error /= len(loader)
-    
-    if inst_count > 0:
-        train_inst_loss /= inst_count
-    
-    if verbose:
-        print(f'\nEpoch {epoch}: train_loss={train_loss:.4f}, '
-              f'train_clustering_loss={train_inst_loss:.4f}, train_error={train_error:.4f}')
-        for i in range(n_classes):
-            acc, correct, count = acc_logger.get_summary(i)
-            if acc is not None:
-                print(f'  Class {i}: acc={acc:.4f}, correct={correct}/{count}')
-    
-    return train_loss, train_error, train_inst_loss
+    return total_loss / len(loader)
 
 
-def validate_clam(epoch, model, loader, n_classes, loss_fn, device, verbose=True):
-    """
-    Validation loop for CLAM.
-    
-    Returns:
-        val_loss, val_error, val_auc, val_inst_loss
-    """
+def validate(model, loader, n_classes, loss_fn, device):
+    """Validate and return metrics."""
     model.eval()
-    acc_logger = AccuracyLogger(n_classes=n_classes)
-    inst_logger = AccuracyLogger(n_classes=2)
-    
     val_loss = 0.0
-    val_error = 0.0
-    val_inst_loss = 0.0
-    inst_count = 0
-    
-    prob = np.zeros((len(loader), n_classes))
-    labels = np.zeros(len(loader))
+    probs = []
+    labels = []
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        for batch in loader:
             features = batch['features']
             label = batch['label']
             
@@ -274,443 +134,304 @@ def validate_clam(epoch, model, loader, n_classes, loss_fn, device, verbose=True
             data = features.to(device)
             lbl = label.to(device)
             
-            # Forward pass
-            logits, Y_prob, Y_hat, _, instance_dict = model(data, label=lbl, instance_eval=True)
-            
-            acc_logger.log(Y_hat, lbl)
-            
-            # Losses
-            loss = loss_fn(logits, lbl)
-            val_loss += loss.item()
-            
-            instance_loss = instance_dict['instance_loss']
-            inst_count += 1
-            val_inst_loss += instance_loss.item()
-            
-            # Log instance predictions
-            inst_preds = instance_dict['inst_preds']
-            inst_labels = instance_dict['inst_labels']
-            for p, t in zip(inst_preds, inst_labels):
-                inst_logger.log(torch.tensor([p]), torch.tensor([t]))
-            
-            prob[batch_idx] = Y_prob.cpu().numpy()
-            labels[batch_idx] = lbl.item()
-            
-            error = calculate_error(Y_hat, lbl)
-            val_error += error
+            logits, Y_prob, _, _, _ = model(data, instance_eval=False)
+            val_loss += loss_fn(logits, lbl).item()
+            probs.append(Y_prob.cpu().numpy())
+            labels.append(lbl.item())
     
-    val_error /= len(loader)
-    val_loss /= len(loader)
+    probs = np.vstack(probs)
+    labels = np.array(labels)
     
-    if inst_count > 0:
-        val_inst_loss /= inst_count
+    auc = roc_auc_score(labels, probs[:, 1]) if len(np.unique(labels)) > 1 else 0.5
+    acc = accuracy_score(labels, np.argmax(probs, axis=1))
     
-    # Calculate AUC
-    if n_classes == 2:
-        auc = roc_auc_score(labels, prob[:, 1])
-    else:
-        from sklearn.preprocessing import label_binarize
-        binary_labels = label_binarize(labels, classes=[i for i in range(n_classes)])
-        auc = roc_auc_score(binary_labels, prob, multi_class='ovr', average='macro')
+    return val_loss / len(loader), auc, acc, probs, labels
+
+
+def create_model(args, instance_loss_fn, device):
+    """Create fresh model."""
+    model_dict = {
+        'gate': True,
+        'size_arg': args.model_size,
+        'dropout': args.dropout,
+        'k_sample': args.k_sample,
+        'n_classes': 2,
+        'instance_loss_fn': instance_loss_fn,
+        'subtyping': False,
+        'embed_dim': args.embed_dim
+    }
     
-    if verbose:
-        print(f'\nVal Set: val_loss={val_loss:.4f}, val_error={val_error:.4f}, auc={auc:.4f}')
-        if inst_count > 0:
-            for i in range(2):
-                acc, correct, count = inst_logger.get_summary(i)
-                if acc is not None:
-                    print(f'  Instance class {i} clustering acc: {acc:.4f}, correct={correct}/{count}')
+    model = CLAM_SB(**model_dict) if args.model_type == 'clam_sb' else CLAM_MB(**model_dict)
+    model.apply(initialize_weights)
+    initialize_attention_weights(model.attention_net)
+    for clf in model.instance_classifiers:
+        initialize_attention_weights(clf)
     
-    return val_loss, val_error, auc, val_inst_loss
+    return model.to(device)
+
+
+def run_cv_for_config(config, patients, labels, df, args, device, n_folds=5):
+    """
+    Run cross-validation for a specific hyperparameter configuration.
+    Returns mean AUC and std.
+    """
+    bag_weight = config['bag_weight']
+    dropout = config.get('dropout', args.dropout)
+    k_sample = config.get('k_sample', args.k_sample)
+    lr = config.get('lr', args.lr)
+    
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=args.seed)
+    fold_aucs = []
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(patients, labels)):
+        train_patients = patients[train_idx]
+        val_patients = patients[val_idx]
+        
+        # Create datasets
+        train_dataset = CLAMDataset(train_patients, df, args.features_dir)
+        val_dataset = CLAMDataset(val_patients, df, args.features_dir)
+        
+        train_loader = DataLoader(
+            train_dataset, batch_size=1, shuffle=True,
+            num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True
+        )
+        
+        # Class weights
+        train_labels = np.array([train_dataset.labels[p] for p in train_dataset.valid_patients])
+        class_weights = compute_class_weight('balanced', classes=np.unique(train_labels), y=train_labels)
+        class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+        
+        # Loss functions
+        if args.use_focal_loss:
+            bag_loss_fn = FocalLoss(alpha=class_weights, gamma=args.focal_gamma, 
+                                    label_smoothing=args.label_smoothing).to(device)
+        else:
+            bag_loss_fn = nn.CrossEntropyLoss(weight=class_weights, 
+                                               label_smoothing=args.label_smoothing).to(device)
+        
+        instance_loss_fn = SmoothTop1SVM(n_classes=2).to(device)
+        
+        # Create model with current config
+        args_copy = argparse.Namespace(**vars(args))
+        args_copy.dropout = dropout
+        args_copy.k_sample = k_sample
+        model = create_model(args_copy, instance_loss_fn, device)
+        
+        optimizer = Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+        
+        # Warmup + cosine scheduler
+        def warmup_lambda(epoch):
+            if epoch < args.warmup_epochs:
+                return (epoch + 1) / args.warmup_epochs
+            return 1.0
+        
+        warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+        main_scheduler = CosineAnnealingLR(optimizer, T_max=args.max_epochs - args.warmup_epochs, 
+                                           eta_min=args.min_lr)
+        
+        early_stopping = EarlyStopping(patience=args.patience, stop_epoch=15, mode='min')
+        
+        # Training loop
+        best_auc = 0.0
+        for epoch in range(args.max_epochs):
+            train_epoch(model, train_loader, optimizer, bag_weight, bag_loss_fn, device,
+                       max_grad_norm=args.max_grad_norm, bag_dropout=args.bag_dropout)
+            
+            val_loss, val_auc, _, _, _ = validate(model, val_loader, 2, bag_loss_fn, device)
+            
+            if epoch < args.warmup_epochs:
+                warmup_scheduler.step()
+            else:
+                main_scheduler.step()
+            
+            if val_auc > best_auc:
+                best_auc = val_auc
+            
+            if early_stopping(epoch, val_loss, model):
+                break
+        
+        fold_aucs.append(best_auc)
+    
+    return np.mean(fold_aucs), np.std(fold_aucs), fold_aucs
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train CLAM model')
+    parser = argparse.ArgumentParser(description='Grid Search for CLAM hyperparameters')
     
     # Data paths
-    parser.add_argument('--clinical_csv', type=str, default='clinical_data.csv',
-                        help='Path to clinical data CSV')
-    parser.add_argument('--features_dir', type=str, default='features',
-                        help='Directory containing extracted features')
-    parser.add_argument('--output_dir', type=str, default='results',
-                        help='Directory to save results')
+    parser.add_argument('--clinical_csv', type=str, default='clinical_data.csv')
+    parser.add_argument('--features_dir', type=str, default='features')
+    # Default output directory uses current date
+    default_output_dir = f"results_{datetime.now().strftime('%Y-%m-%d')}"
+    parser.add_argument('--output_dir', type=str, default=default_output_dir)
     
-    # Model parameters
-    parser.add_argument('--model_type', type=str, choices=['clam_sb', 'clam_mb'], 
-                        default='clam_sb', help='Model type')
-    parser.add_argument('--model_size', type=str, choices=['small', 'big'],
-                        default='small', help='Model size')
-    parser.add_argument('--embed_dim', type=int, default=2048,
-                        help='Feature embedding dimension (2048 for ResNet50)')
-    parser.add_argument('--n_classes', type=int, default=2,
-                        help='Number of classes')
-    parser.add_argument('--dropout', type=float, default=0.5,
-                        help='Dropout rate (0.5 recommended for small datasets)')
-    parser.add_argument('--k_sample', type=int, default=8,
-                        help='Number of positive/negative patches to sample for clustering')
+    # Grid search parameters
+    parser.add_argument('--bag_weights', type=str, default='0.5,0.6,0.7,0.8,0.9',
+                        help='Comma-separated bag_weight values to test')
+    parser.add_argument('--dropouts', type=str, default='0.5',
+                        help='Comma-separated dropout values to test')
+    parser.add_argument('--k_samples', type=str, default='8',
+                        help='Comma-separated k_sample values to test')
+    parser.add_argument('--lrs', type=str, default='0.0001',
+                        help='Comma-separated learning rate values to test')
     
-    # Training parameters
-    parser.add_argument('--max_epochs', type=int, default=200,
-                        help='Maximum number of epochs')
-    parser.add_argument('--lr', type=float, default=2e-4,
-                        help='Learning rate')
-    parser.add_argument('--bag_weight', type=float, default=0.7,
-                        help='Weight for bag loss (clustering weight = 1 - bag_weight). '
-                             'Higher values focus more on slide-level classification.')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
-                        help='Weight decay for optimizer (L2 regularization)')
+    # CV settings
+    parser.add_argument('--n_folds', type=int, default=5)
+    parser.add_argument('--seed', type=int, default=42)
     
-    # Gradient clipping
-    parser.add_argument('--max_grad_norm', type=float, default=1.0,
-                        help='Maximum gradient norm for clipping')
+    # Model parameters (fixed)
+    parser.add_argument('--model_type', type=str, default='clam_sb')
+    parser.add_argument('--model_size', type=str, default='small')
+    parser.add_argument('--embed_dim', type=int, default=768)
+    parser.add_argument('--dropout', type=float, default=0.5)
+    parser.add_argument('--k_sample', type=int, default=8)
     
-    # Loss functions
-    parser.add_argument('--bag_loss', type=str, choices=['ce', 'svm'], default='ce',
-                        help='Bag-level loss function')
-    parser.add_argument('--inst_loss', type=str, choices=['ce', 'svm'], default='svm',
-                        help='Instance-level loss function')
-    parser.add_argument('--use_class_weights', action='store_true', default=True,
-                        help='Use class weights to handle imbalanced data')
-    parser.add_argument('--label_smoothing', type=float, default=0.1,
-                        help='Label smoothing factor (0 = no smoothing)')
-    parser.add_argument('--use_focal_loss', action='store_true', default=False,
-                        help='Use Focal Loss instead of CrossEntropy for bag loss')
-    parser.add_argument('--focal_gamma', type=float, default=2.0,
-                        help='Focal loss gamma parameter (focusing strength)')
-    parser.add_argument('--bag_dropout', type=float, default=0.1,
-                        help='Randomly drop this fraction of instances during training (MIL augmentation)')
+    # Training parameters (fixed)
+    parser.add_argument('--max_epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    parser.add_argument('--bag_dropout', type=float, default=0.15)
+    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--warmup_epochs', type=int, default=5)
+    parser.add_argument('--min_lr', type=float, default=1e-6)
     
-    # Data split
-    parser.add_argument('--test_size', type=float, default=0.15,
-                        help='Test set proportion')
-    parser.add_argument('--val_size', type=float, default=0.15,
-                        help='Validation set proportion')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    parser.add_argument('--create_new_splits', action='store_true',
-                        help='Create new train/val/test splits')
-    
-    # Early stopping
-    parser.add_argument('--early_stopping', action='store_true', default=True,
-                        help='Enable early stopping')
-    parser.add_argument('--patience', type=int, default=15,
-                        help='Early stopping patience')
-    parser.add_argument('--es_mode', type=str, choices=['loss', 'auc'], default='loss',
-                        help='Early stopping mode: loss (recommended) or auc')
-    
-    # Learning rate scheduler
-    parser.add_argument('--scheduler', type=str, choices=['cosine', 'plateau', 'none'], 
-                        default='cosine', help='Learning rate scheduler')
-    parser.add_argument('--min_lr', type=float, default=1e-6,
-                        help='Minimum learning rate for scheduler')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
-                        help='Number of warmup epochs (gradual LR increase)')
+    # Loss
+    parser.add_argument('--use_focal_loss', action='store_true', default=False)
+    parser.add_argument('--focal_gamma', type=float, default=2.0)
+    parser.add_argument('--label_smoothing', type=float, default=0.1)
     
     # Other
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of data loading workers')
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
     
-    # Set random seed for reproducibility
+    # Parse grid search values
+    bag_weights = [float(x) for x in args.bag_weights.split(',')]
+    dropouts = [float(x) for x in args.dropouts.split(',')]
+    k_samples = [int(x) for x in args.k_samples.split(',')]
+    lrs = [float(x) for x in args.lrs.split(',')]
+    
+    # Set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
     
     # Setup device
-    if args.device == 'cuda' and torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        device = torch.device('cpu')
-        print("Using CPU")
+    device = torch.device('cuda' if args.device == 'cuda' and torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Save arguments
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
-    
-    # Print training configuration
-    print("\n" + "="*60)
-    print("CLAM Training Configuration")
-    print("="*60)
-    print(f"Model type: {args.model_type}")
-    print(f"Model size: {args.model_size}")
-    print(f"Dropout: {args.dropout}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Weight decay: {args.weight_decay}")
-    print(f"Bag weight: {args.bag_weight} (Clustering weight: {1-args.bag_weight})")
-    print(f"K sample: {args.k_sample}")
-    print(f"Instance loss: {args.inst_loss}")
-    print(f"Scheduler: {args.scheduler}")
-    print(f"Early stopping: {args.es_mode} (patience={args.patience})")
-    print(f"Gradient clipping: max_norm={args.max_grad_norm}")
-    print("="*60 + "\n")
-    
     # Load data
-    print("Loading data...")
-    train_loader, val_loader, test_loader = get_dataloaders(
-        args.clinical_csv,
-        args.features_dir,
-        batch_size=1,
-        num_workers=args.num_workers,
-        create_new_splits=args.create_new_splits,
-        test_size=args.test_size,
-        val_size=args.val_size,
-        random_seed=args.seed
-    )
+    print("\nLoading data...")
+    patients, labels, df = get_patients_and_labels(args.clinical_csv, args.features_dir)
+    print(f"Total patients: {len(patients)}")
+    print(f"Class distribution: {sum(labels)} progressors, {len(labels) - sum(labels)} responders")
     
-    # Compute class weights from training data for handling class imbalance
-    train_labels = []
-    for batch in train_loader:
-        train_labels.append(batch['label'].item())
-    train_labels = np.array(train_labels)
+    # Generate all configurations
+    configs = []
+    for bw, do, ks, lr in product(bag_weights, dropouts, k_samples, lrs):
+        configs.append({
+            'bag_weight': bw,
+            'dropout': do,
+            'k_sample': ks,
+            'lr': lr
+        })
     
-    class_counts = np.bincount(train_labels)
-    print(f"\nClass distribution in training set:")
-    for i, count in enumerate(class_counts):
-        print(f"  Class {i}: {count} samples ({100*count/len(train_labels):.1f}%)")
+    print(f"\n{'='*60}")
+    print(f"GRID SEARCH: {len(configs)} configurations x {args.n_folds} folds")
+    print(f"{'='*60}")
+    print(f"bag_weight: {bag_weights}")
+    print(f"dropout: {dropouts}")
+    print(f"k_sample: {k_samples}")
+    print(f"lr: {lrs}")
+    print(f"{'='*60}\n")
     
-    # Compute balanced class weights
-    if args.use_class_weights:
-        class_weights = compute_class_weight('balanced', classes=np.unique(train_labels), y=train_labels)
-        class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
-        print(f"  Class weights: {class_weights.cpu().numpy()}")
-    else:
-        class_weights = None
-    
-    # Initialize loss functions
-    print("\nInitializing loss functions...")
-    if args.bag_loss == 'svm':
-        bag_loss_fn = SmoothTop1SVM(n_classes=args.n_classes)
-    elif args.use_focal_loss:
-        # Use Focal Loss for better handling of class imbalance
-        bag_loss_fn = FocalLoss(
-            alpha=class_weights,
-            gamma=args.focal_gamma,
-            label_smoothing=args.label_smoothing
-        )
-        print(f"  Using FocalLoss with gamma={args.focal_gamma}, label_smoothing={args.label_smoothing}")
-    else:
-        # Use class weights and label smoothing for CrossEntropy
-        bag_loss_fn = nn.CrossEntropyLoss(
-            weight=class_weights,
-            label_smoothing=args.label_smoothing
-        )
-        print(f"  Using CrossEntropyLoss with label_smoothing={args.label_smoothing}")
-    
-    if args.inst_loss == 'svm':
-        instance_loss_fn = SmoothTop1SVM(n_classes=2)
-    else:
-        instance_loss_fn = nn.CrossEntropyLoss()
-    
-    bag_loss_fn = bag_loss_fn.to(device)
-    instance_loss_fn = instance_loss_fn.to(device)
-    
-    # Initialize model
-    print("\nInitializing model...")
-    model_dict = {
-        'gate': True,
-        'size_arg': args.model_size,
-        'dropout': args.dropout,
-        'k_sample': args.k_sample,
-        'n_classes': args.n_classes,
-        'instance_loss_fn': instance_loss_fn,
-        'subtyping': False,
-        'embed_dim': args.embed_dim
-    }
-    
-    if args.model_type == 'clam_sb':
-        model = CLAM_SB(**model_dict)
-    else:
-        model = CLAM_MB(**model_dict)
-    
-    # Initialize weights with appropriate strategies
-    model.apply(initialize_weights)
-    # Additional attention-specific initialization
-    initialize_attention_weights(model.attention_net)
-    for classifier in model.instance_classifiers:
-        initialize_attention_weights(classifier)
-    
-    model = model.to(device)
-    
-    # Print model summary
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
-    # Initialize optimizer
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    # Warmup + main scheduler
-    def warmup_lambda(epoch):
-        """Linear warmup for first warmup_epochs, then return 1.0."""
-        if epoch < args.warmup_epochs:
-            return (epoch + 1) / args.warmup_epochs
-        return 1.0
-    
-    warmup_scheduler = LambdaLR(optimizer, lr_lambda=warmup_lambda)
-    
-    # Initialize main learning rate scheduler
-    if args.scheduler == 'cosine':
-        # Cosine annealing after warmup
-        main_scheduler = CosineAnnealingLR(
-            optimizer, 
-            T_max=args.max_epochs - args.warmup_epochs, 
-            eta_min=args.min_lr
-        )
-        print(f"Using CosineAnnealingLR scheduler (T_max={args.max_epochs - args.warmup_epochs}, min_lr={args.min_lr})")
-    elif args.scheduler == 'plateau':
-        main_scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, 
-                                       min_lr=args.min_lr, verbose=True)
-        print(f"Using ReduceLROnPlateau scheduler")
-    else:
-        main_scheduler = None
-        print("No main learning rate scheduler")
-    
-    print(f"Warmup: {args.warmup_epochs} epochs")
-    
-    # Initialize early stopping
-    if args.early_stopping:
-        es_mode = 'min' if args.es_mode == 'loss' else 'max'
-        early_stopping = EarlyStopping(
-            patience=args.patience, 
-            stop_epoch=30,  # Reduced from 50 for faster experimentation
-            verbose=True,
-            delta=0.001,
-            smoothing_factor=0.3,
-            mode=es_mode
-        )
-        print(f"Early stopping enabled: mode={args.es_mode}, patience={args.patience}")
-    else:
-        early_stopping = None
-    
-    # Training loop
-    print("\nStarting training...")
+    # Run grid search
+    results = []
     best_auc = 0.0
-    model_path = os.path.join(args.output_dir, 'model.pth')
+    best_config = None
     
-    training_history = {
-        'train_loss': [],
-        'train_error': [],
-        'train_inst_loss': [],
-        'val_loss': [],
-        'val_error': [],
-        'val_auc': [],
-        'val_inst_loss': [],
-        'learning_rate': []
-    }
-    
-    for epoch in range(args.max_epochs):
-        current_lr = optimizer.param_groups[0]['lr']
-        is_warmup = epoch < args.warmup_epochs
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1}/{args.max_epochs} | LR: {current_lr:.6f}" + 
-              (" [WARMUP]" if is_warmup else ""))
-        print('='*60)
+    for i, config in enumerate(configs):
+        print(f"\n[{i+1}/{len(configs)}] Testing: bag_weight={config['bag_weight']}, "
+              f"dropout={config['dropout']}, k_sample={config['k_sample']}, lr={config['lr']}")
         
-        # Training with gradient clipping and bag dropout
-        train_loss, train_error, train_inst_loss = train_loop_clam(
-            epoch, model, train_loader, optimizer, args.n_classes,
-            args.bag_weight, bag_loss_fn, device, 
-            max_grad_norm=args.max_grad_norm,
-            bag_dropout=args.bag_dropout
+        mean_auc, std_auc, fold_aucs = run_cv_for_config(
+            config, patients, labels, df, args, device, args.n_folds
         )
         
-        # Validation
-        val_loss, val_error, val_auc, val_inst_loss = validate_clam(
-            epoch, model, val_loader, args.n_classes, bag_loss_fn, device
-        )
+        result = {
+            **config,
+            'mean_auc': float(mean_auc),
+            'std_auc': float(std_auc),
+            'fold_aucs': [float(x) for x in fold_aucs]
+        }
+        results.append(result)
         
-        # Update learning rate scheduler
-        if is_warmup:
-            # During warmup, use warmup scheduler
-            warmup_scheduler.step()
-        elif main_scheduler is not None:
-            # After warmup, use main scheduler
-            if isinstance(main_scheduler, ReduceLROnPlateau):
-                main_scheduler.step(val_loss)
-            else:
-                main_scheduler.step()
+        print(f"  -> Mean AUC: {mean_auc:.4f} ± {std_auc:.4f}")
         
-        # Log history
-        training_history['train_loss'].append(train_loss)
-        training_history['train_error'].append(train_error)
-        training_history['train_inst_loss'].append(train_inst_loss)
-        training_history['val_loss'].append(val_loss)
-        training_history['val_error'].append(val_error)
-        training_history['val_auc'].append(val_auc)
-        training_history['val_inst_loss'].append(val_inst_loss)
-        training_history['learning_rate'].append(current_lr)
-        
-        # Save best model and check early stopping
-        if early_stopping:
-            # Use val_loss for 'loss' mode, val_auc for 'auc' mode
-            es_metric = val_loss if args.es_mode == 'loss' else val_auc
-            stop = early_stopping(epoch, es_metric, model, model_path)
-            if stop:
-                print(f"\nEarly stopping at epoch {epoch+1}")
-                break
-        else:
-            if val_auc > best_auc:
-                best_auc = val_auc
-                torch.save(model.state_dict(), model_path)
-                print(f"Saved best model with AUC: {best_auc:.4f}")
+        if mean_auc > best_auc:
+            best_auc = mean_auc
+            best_config = config.copy()
+            best_config['mean_auc'] = mean_auc
+            best_config['std_auc'] = std_auc
+            print(f"  *** New best! ***")
     
-    # Save training history
-    with open(os.path.join(args.output_dir, 'training_history.json'), 'w') as f:
-        json.dump(training_history, f, indent=2)
+    # Sort results by mean AUC
+    results_sorted = sorted(results, key=lambda x: x['mean_auc'], reverse=True)
     
-    # Final evaluation on test set
-    print("\n" + "="*60)
-    print("Final Evaluation on Test Set")
-    print("="*60)
+    # Print summary
+    print(f"\n{'='*60}")
+    print("GRID SEARCH RESULTS (sorted by AUC)")
+    print(f"{'='*60}")
     
-    # Load best model
-    model.load_state_dict(torch.load(model_path, weights_only=True))
+    print(f"\n{'Rank':<5} {'bag_weight':<12} {'dropout':<10} {'k_sample':<10} {'lr':<12} {'AUC':<20}")
+    print("-" * 70)
+    for i, r in enumerate(results_sorted[:10]):
+        auc_str = f"{r['mean_auc']:.4f} ± {r['std_auc']:.4f}"
+        print(f"{i+1:<5} {r['bag_weight']:<12} {r['dropout']:<10} {r['k_sample']:<10} {r['lr']:<12} {auc_str:<20}")
     
-    test_loss, test_error, test_auc, test_inst_loss = validate_clam(
-        0, model, test_loader, args.n_classes, bag_loss_fn, device
-    )
+    print(f"\n{'='*60}")
+    print("BEST CONFIGURATION")
+    print(f"{'='*60}")
+    print(f"bag_weight: {best_config['bag_weight']}")
+    print(f"dropout: {best_config['dropout']}")
+    print(f"k_sample: {best_config['k_sample']}")
+    print(f"lr: {best_config['lr']}")
+    print(f"Mean AUC: {best_config['mean_auc']:.4f} ± {best_config['std_auc']:.4f}")
+    print(f"{'='*60}")
     
-    print(f"\nTest Results:")
-    print(f"  Loss: {test_loss:.4f}")
-    print(f"  Error: {test_error:.4f}")
-    print(f"  AUC: {test_auc:.4f}")
-    print(f"  Accuracy: {1 - test_error:.4f}")
-    
-    # Save final results
-    # Get best validation score based on early stopping mode
-    if early_stopping:
-        best_val_metric = early_stopping.best_raw_score
-        best_val_metric_name = 'best_val_loss' if args.es_mode == 'loss' else 'best_val_auc'
-    else:
-        best_val_metric = best_auc
-        best_val_metric_name = 'best_val_auc'
-    
-    # Also compute best val AUC from history for reference
-    best_val_auc_from_history = max(training_history['val_auc']) if training_history['val_auc'] else 0.0
-    
-    final_results = {
-        'test_loss': test_loss,
-        'test_error': test_error,
-        'test_auc': test_auc,
-        'test_accuracy': 1 - test_error,
-        best_val_metric_name: best_val_metric,
-        'best_val_auc': best_val_auc_from_history
+    # Save results
+    output = {
+        'timestamp': datetime.now().isoformat(),
+        'n_folds': args.n_folds,
+        'n_patients': len(patients),
+        'grid_search_params': {
+            'bag_weights': bag_weights,
+            'dropouts': dropouts,
+            'k_samples': k_samples,
+            'lrs': lrs
+        },
+        'best_config': best_config,
+        'all_results': results_sorted
     }
     
-    with open(os.path.join(args.output_dir, 'final_results.json'), 'w') as f:
-        json.dump(final_results, f, indent=2)
+    with open(os.path.join(args.output_dir, 'gridsearch_results.json'), 'w') as f:
+        json.dump(output, f, indent=2)
     
-    print(f"\nTraining complete. Model saved to {model_path}")
-    print(f"Results saved to {args.output_dir}/")
+    # Save best config for easy reuse
+    with open(os.path.join(args.output_dir, 'best_config.json'), 'w') as f:
+        json.dump(best_config, f, indent=2)
+    
+    print(f"\nResults saved to {args.output_dir}/")
 
 
 if __name__ == '__main__':

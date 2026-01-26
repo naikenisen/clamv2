@@ -15,6 +15,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from tqdm import tqdm
+import pandas as pd
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -129,6 +130,101 @@ def normalize_attention_minmax(attention):
         normalized = np.zeros_like(attention)
     
     return normalized
+
+
+def create_attention_overlay_on_tma(patient_id, attention_scores, coords, 
+                                     dataset_dir='dataset', tiles_dir='dataset_tiles',
+                                     output_path=None, tile_size=256, 
+                                     output_size=(1024, 1024), alpha=0.5,
+                                     predicted_label=None, true_label=None):
+    """
+    Create a 1024x1024 image with attention overlay on the original TMA.
+    High attention -> Red, Low attention -> Blue.
+    
+    Args:
+        patient_id: Patient ID (e.g., '13901')
+        attention_scores: Normalized attention scores (N,) in [0, 1]
+        coords: Tile coordinates (N, 2) in (x, y) pixel format
+        dataset_dir: Directory containing original TMA images
+        tiles_dir: Directory containing tile folders
+        output_path: Path to save the overlay image
+        tile_size: Size of each tile in the original image
+        output_size: Output image size (width, height)
+        alpha: Transparency of the attention overlay
+        predicted_label: Predicted class label string
+        true_label: Ground truth class label string
+        
+    Returns:
+        PIL Image with attention overlay
+    """
+    # Load original TMA image
+    tma_path = os.path.join(dataset_dir, f"{patient_id}.png")
+    if not os.path.exists(tma_path):
+        print(f"Warning: TMA image not found at {tma_path}")
+        return None
+    
+    tma_img = Image.open(tma_path).convert('RGBA')
+    original_size = tma_img.size  # (width, height)
+    
+    # Create attention overlay at original resolution
+    attention_overlay = Image.new('RGBA', original_size, (0, 0, 0, 0))
+    
+    # Create blue-to-red colormap for attention
+    # Low attention (0) -> Blue, High attention (1) -> Red
+    for i, (coord, attn) in enumerate(zip(coords, attention_scores)):
+        x, y = int(coord[0]), int(coord[1])
+        
+        # Interpolate color: Blue (low) -> Red (high)
+        # attn in [0, 1]
+        red = int(255 * attn)
+        blue = int(255 * (1 - attn))
+        green = 0
+        alpha_channel = int(255 * alpha)
+        
+        # Create colored tile
+        tile_color = Image.new('RGBA', (tile_size, tile_size), (red, green, blue, alpha_channel))
+        
+        # Paste at the correct position
+        attention_overlay.paste(tile_color, (x, y))
+    
+    # Composite overlay on TMA
+    composite = Image.alpha_composite(tma_img, attention_overlay)
+    
+    # Resize to output size
+    composite_resized = composite.resize(output_size, Image.Resampling.LANCZOS)
+    
+    # Convert to RGB for saving as PNG with title
+    final_img = composite_resized.convert('RGB')
+    
+    # Create figure with title
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=102.4)  # 10*102.4 ≈ 1024
+    ax.imshow(final_img)
+    ax.axis('off')
+    
+    # Add title with predicted and true labels
+    class_names = ['Responder', 'Progressor']
+    pred_str = predicted_label if predicted_label else '?'
+    true_str = true_label if true_label else '?'
+    
+    # Color code: green if correct, red if incorrect
+    if predicted_label and true_label:
+        title_color = 'green' if predicted_label == true_label else 'red'
+    else:
+        title_color = 'black'
+    
+    title = f"Patient {patient_id}\nPrédiction: {pred_str} | Vérité terrain: {true_str}"
+    ax.set_title(title, fontsize=14, fontweight='bold', color=title_color)
+    
+    plt.tight_layout()
+    
+    if output_path:
+        plt.savefig(output_path, dpi=102.4, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+    else:
+        plt.close()
+        return final_img
+    
+    return final_img
 
 
 def create_attention_heatmap(attention_scores, coords, tile_size=256, 
@@ -383,6 +479,17 @@ def run_inference(args):
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Create overlay output directory
+    if args.generate_overlays:
+        os.makedirs(args.overlay_output_dir, exist_ok=True)
+        print(f"Overlay images will be saved to {args.overlay_output_dir}/")
+    
+    # Load clinical data for true labels
+    clinical_df = pd.read_csv(args.clinical_csv)
+    id_col = clinical_df.columns[0]
+    clinical_df[id_col] = clinical_df[id_col].astype(str).str.replace('.0', '', regex=False)
+    class_names = ['Responder', 'Progressor']
+    
     # Load test data
     print("\nLoading test data...")
     if args.patient_id:
@@ -435,6 +542,32 @@ def run_inference(args):
                 output_path=full_heatmap_path
             )
             print(f"Full resolution heatmap saved to {full_heatmap_path}")
+        
+        # Create TMA overlay image
+        if args.generate_overlays:
+            # Get true label from clinical data
+            patient_row = clinical_df[clinical_df[id_col] == args.patient_id]
+            if not patient_row.empty:
+                true_label_idx = int(patient_row['status'].values[0])
+                true_label = class_names[true_label_idx]
+            else:
+                true_label = '?'
+            
+            overlay_path = os.path.join(args.overlay_output_dir, f"{args.patient_id}.png")
+            create_attention_overlay_on_tma(
+                args.patient_id,
+                np.array(result['attention_normalized']),
+                np.array(result['coords']),
+                dataset_dir=args.dataset_dir,
+                tiles_dir=args.tiles_dir,
+                output_path=overlay_path,
+                tile_size=tile_size,
+                output_size=(1024, 1024),
+                alpha=args.overlay_alpha,
+                predicted_label=result['prediction_label'],
+                true_label=true_label
+            )
+            print(f"TMA overlay saved to {overlay_path}")
         
         # Save results
         result_path = os.path.join(args.output_dir, f"{args.patient_id}_results.json")
@@ -491,6 +624,24 @@ def run_inference(args):
                     np.array(result['attention_normalized']),
                     np.array(result['coords']),
                     output_path=heatmap_path
+                )
+            
+            # Create TMA overlay image
+            if args.generate_overlays:
+                true_label = class_names[label.item()]
+                overlay_path = os.path.join(args.overlay_output_dir, f"{patient_id}.png")
+                create_attention_overlay_on_tma(
+                    patient_id,
+                    np.array(result['attention_normalized']),
+                    np.array(result['coords']),
+                    dataset_dir=args.dataset_dir,
+                    tiles_dir=args.tiles_dir,
+                    output_path=overlay_path,
+                    tile_size=256,
+                    output_size=(1024, 1024),
+                    alpha=args.overlay_alpha,
+                    predicted_label=result['prediction_label'],
+                    true_label=true_label
                 )
         
         # Calculate metrics
@@ -554,10 +705,18 @@ def main():
                         help='Path to clinical data CSV')
     parser.add_argument('--splits_path', type=str, default='splits.json',
                         help='Path to splits JSON file')
+    parser.add_argument('--dataset_dir', type=str, default='dataset',
+                        help='Directory containing original TMA images')
+    parser.add_argument('--tiles_dir', type=str, default='dataset_tiles',
+                        help='Directory containing tile folders')
     
-    # Output
-    parser.add_argument('--output_dir', type=str, default='inference_output',
+    # Output - default uses current date
+    from datetime import datetime
+    default_output_dir = f"inference_{datetime.now().strftime('%Y-%m-%d')}"
+    parser.add_argument('--output_dir', type=str, default=default_output_dir,
                         help='Directory to save inference results')
+    parser.add_argument('--overlay_output_dir', type=str, default='results_inference',
+                        help='Directory to save TMA overlay images (1024x1024)')
     
     # Patient selection
     parser.add_argument('--patient_id', type=str, default=None,
@@ -580,10 +739,14 @@ def main():
     # Heatmap options
     parser.add_argument('--generate_heatmaps', action='store_true', default=True,
                         help='Generate heatmaps for all patients')
+    parser.add_argument('--generate_overlays', action='store_true', default=True,
+                        help='Generate TMA overlay images in results_inference')
     parser.add_argument('--full_resolution', action='store_true',
                         help='Generate full resolution heatmaps')
     parser.add_argument('--colormap', type=str, default='jet',
                         help='Colormap for heatmaps')
+    parser.add_argument('--overlay_alpha', type=float, default=0.5,
+                        help='Transparency of attention overlay (0-1)')
     
     # Other
     parser.add_argument('--num_workers', type=int, default=4,

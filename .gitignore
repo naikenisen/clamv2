@@ -5,3 +5,9 @@
 /features
 /results
 /inference_output
+/results_gridsearch
+/results_inference
+# Date-based result folders
+/results_*
+/inference_*
+*.out
