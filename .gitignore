@@ -11,3 +11,5 @@
 /results_*
 /inference_*
 *.out
+# ignorer les dossier commencant par results
+/results*/

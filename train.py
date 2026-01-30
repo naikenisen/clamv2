@@ -254,6 +254,9 @@ def run_cv_for_config(config, patients, labels, df, args, device, n_folds=5):
             if early_stopping(epoch, val_loss, model):
                 break
         
+        # À la fin de run_cv_for_config, restaurer et retourner le meilleur modèle
+        model.load_state_dict(early_stopping.best_model_state)
+        
         fold_aucs.append(best_auc)
     
     return np.mean(fold_aucs), np.std(fold_aucs), fold_aucs
@@ -430,6 +433,9 @@ def main():
     # Save best config for easy reuse
     with open(os.path.join(args.output_dir, 'best_config.json'), 'w') as f:
         json.dump(best_config, f, indent=2)
+    
+    # Dans main(), après avoir trouvé la meilleure config, sauvegarder les poids :
+    torch.save(best_model.state_dict(), os.path.join(args.output_dir, 'best_model.pt'))
     
     print(f"\nResults saved to {args.output_dir}/")
 
