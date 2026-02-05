@@ -1,3 +1,5 @@
+<img width="2242" height="1267" alt="image" src="https://github.com/user-attachments/assets/3e0d6e0b-aafa-400b-a129-63b837c2ee01" />
+
 # ClamV2 - Guide d'Utilisation
 Ce guide vous aidera à utiliser le projet ClamV2 pour l'extraction de features, l'entraînement de modèles et l'inférence.
 
