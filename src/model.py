@@ -225,7 +225,7 @@ class Attn_Net_Gated(nn.Module):
         return A, x
 
 
-class CLAM_SB(nn.Module):
+class CLAM_MODEL(nn.Module):
     """
     CLAM Single Branch Model.
     Exact implementation following the official Mahmood Lab repository.
@@ -243,7 +243,7 @@ class CLAM_SB(nn.Module):
     
     def __init__(self, gate=True, size_arg="small", dropout=0.5, k_sample=8, 
                  n_classes=2, instance_loss_fn=None, subtyping=False, embed_dim=2048):
-        super(CLAM_SB, self).__init__()
+        super(CLAM_MODEL, self).__init__()
         
         self.size_dict = {
             "small": [embed_dim, 512, 256], 
@@ -450,119 +450,7 @@ class CLAM_SB(nn.Module):
         return logits, Y_prob, Y_hat, A_raw, results_dict
 
 
-class CLAM_MB(CLAM_SB):
-    """
-    CLAM Multi-Branch Model.
-    Uses separate attention branches for each class.
-    
-    Inherits from CLAM_SB and overrides the architecture for multi-branch attention.
-    """
-    
-    def __init__(self, gate=True, size_arg="small", dropout=0.5, k_sample=8,
-                 n_classes=2, instance_loss_fn=None, subtyping=False, embed_dim=2048):
-        nn.Module.__init__(self)
-        
-        self.size_dict = {
-            "small": [embed_dim, 512, 256],
-            "big": [embed_dim, 512, 384]
-        }
-        size = self.size_dict[size_arg]
-        
-        # Feature compression with LayerNorm for stability
-        fc = [
-            nn.Linear(size[0], size[1]), 
-            nn.LayerNorm(size[1]),  # Added LayerNorm for training stability
-            nn.ReLU(), 
-            nn.Dropout(dropout)
-        ]
-        
-        # Multi-branch attention (n_classes attention heads)
-        if gate:
-            attention_net = Attn_Net_Gated(L=size[1], D=size[2], dropout=dropout, n_classes=n_classes)
-        else:
-            attention_net = Attn_Net(L=size[1], D=size[2], dropout=dropout, n_classes=n_classes)
-        
-        fc.append(attention_net)
-        self.attention_net = nn.Sequential(*fc)
-        
-        # Separate classifier for each class
-        bag_classifiers = [nn.Linear(size[1], 1) for _ in range(n_classes)]
-        self.classifiers = nn.ModuleList(bag_classifiers)
-        
-        # Instance classifiers
-        instance_classifiers = [nn.Linear(size[1], 2) for _ in range(n_classes)]
-        self.instance_classifiers = nn.ModuleList(instance_classifiers)
-        
-        self.k_sample = k_sample
-        self.instance_loss_fn = instance_loss_fn if instance_loss_fn else SmoothTop1SVM(n_classes=2)
-        self.n_classes = n_classes
-        self.subtyping = subtyping
-    
-    def forward(self, h, label=None, instance_eval=False, return_features=False, attention_only=False):
-        """
-        Forward pass for CLAM Multi-Branch.
-        """
-        A, h = self.attention_net(h)  # A: (N, n_classes), h: (N, 512)
-        A = torch.transpose(A, 1, 0)  # (n_classes, N)
-        
-        if attention_only:
-            return A
-        
-        A_raw = A
-        A = F.softmax(A, dim=1)  # Softmax over instances for each class
-        
-        if instance_eval:
-            total_inst_loss = 0.0
-            all_preds = []
-            all_targets = []
-            
-            inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze()
-            
-            for i in range(len(self.instance_classifiers)):
-                inst_label = inst_labels[i].item()
-                classifier = self.instance_classifiers[i]
-                
-                if inst_label == 1:  # In-the-class
-                    instance_loss, preds, targets = self.inst_eval(A[i], h, classifier)
-                    all_preds.extend(preds.cpu().numpy())
-                    all_targets.extend(targets.cpu().numpy())
-                else:  # Out-of-the-class
-                    if self.subtyping:
-                        instance_loss, preds, targets = self.inst_eval_out(A[i], h, classifier)
-                        all_preds.extend(preds.cpu().numpy())
-                        all_targets.extend(targets.cpu().numpy())
-                    else:
-                        continue
-                        
-                total_inst_loss += instance_loss
-            
-            if self.subtyping:
-                total_inst_loss /= len(self.instance_classifiers)
-        
-        # Aggregate features using attention (separate for each class)
-        M = torch.mm(A, h)  # (n_classes, 512)
-        
-        # Slide-level classification (separate classifier per class)
-        logits = torch.empty(1, self.n_classes).float().to(M.device)
-        for c in range(self.n_classes):
-            logits[0, c] = self.classifiers[c](M[c])
-        
-        Y_hat = torch.topk(logits, 1, dim=1)[1]
-        Y_prob = F.softmax(logits, dim=1)
-        
-        if instance_eval:
-            results_dict = {
-                'instance_loss': total_inst_loss,
-                'inst_labels': np.array(all_targets),
-                'inst_preds': np.array(all_preds)
-            }
-        else:
-            results_dict = {}
-        
-        if return_features:
-            results_dict.update({'features': M})
-        
-        return logits, Y_prob, Y_hat, A_raw, results_dict
+ # CLAM_MB removed
 
 
 def initialize_weights(module):
@@ -601,27 +489,16 @@ def initialize_attention_weights(module):
 
 if __name__ == '__main__':
     # Test the model
-    print("Testing CLAM_SB...")
-    model = CLAM_SB(gate=True, n_classes=2, embed_dim=2048, k_sample=8)
-    
+    print("Testing CLAM_MODEL...")
+    model = CLAM_MODEL(gate=True, n_classes=2, embed_dim=2048, k_sample=8)
     # Dummy input: 100 instances with 2048-dim features
     x = torch.randn(100, 2048)
     label = torch.tensor([1])
-    
     # Forward pass with instance evaluation
     logits, Y_prob, Y_hat, A, results = model(x, label=label, instance_eval=True)
-    
     print(f"Input shape: {x.shape}")
     print(f"Logits shape: {logits.shape}")
     print(f"Y_prob: {Y_prob}")
     print(f"Y_hat: {Y_hat}")
-    print(f"Attention shape: {A.shape}")
-    print(f"Instance loss: {results['instance_loss']}")
-    
-    print("\nTesting CLAM_MB...")
-    model_mb = CLAM_MB(gate=True, n_classes=2, embed_dim=2048, k_sample=8)
-    logits, Y_prob, Y_hat, A, results = model_mb(x, label=label, instance_eval=True)
-    
-    print(f"Logits shape: {logits.shape}")
     print(f"Attention shape: {A.shape}")
     print(f"Instance loss: {results['instance_loss']}")

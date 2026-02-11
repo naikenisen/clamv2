@@ -8,7 +8,6 @@ Usage:
 
 import os
 import sys
- # argparse removed, config.py used instead
 import json
 import numpy as np
 import torch
@@ -19,6 +18,7 @@ from tqdm import tqdm
 import pandas as pd
 from PIL import Image, PngImagePlugin
 import matplotlib.pyplot as plt
+import config
 
 # Increase limit for large PNG images
 PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024  # 100MB
@@ -26,7 +26,7 @@ PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024  # 100MB
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM
+from src.model import CLAM_MODEL, SmoothTop1SVM
 from src.data_loader import CLAMDataset, collate_fn
 from torch.utils.data import DataLoader
 
@@ -65,10 +65,7 @@ def create_model(config, embed_dim, device):
         'subtyping': False,
         'embed_dim': embed_dim
     }
-    
-    model_type = config.get('model_type', 'clam_sb')
-    model = CLAM_SB(**model_dict) if model_type == 'clam_sb' else CLAM_MB(**model_dict)
-    
+    model = CLAM_MODEL(**model_dict)
     return model.to(device)
 
 
@@ -408,50 +405,15 @@ def plot_roc_curves(train_probs, train_labels, test_probs, test_labels, output_p
 
 
 def main():
-    parser = argparse.ArgumentParser(description='CLAM Inference and Visualization')
-    
-    # Required: results directory
-    parser.add_argument('--results_dir', type=str, required=True,
-                        help='Path to results directory (e.g., results_2026-01-30)')
-    
-    # Data paths
-    parser.add_argument('--clinical_csv', type=str, default='clinical_data.csv')
-    parser.add_argument('--features_dir', type=str, default='features')
-    parser.add_argument('--dataset_dir', type=str, default='dataset',
-                        help='Directory containing original images for attention maps')
-    
-    # Model settings
-    parser.add_argument('--embed_dim', type=int, default=768)
-    # Import config
-    import config
-
     # Set seeds
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
-    device = torch.device('cuda' if config.device == 'cuda' and torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # Paths
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     results_dir = config.output_dir
     model_path = os.path.join(results_dir, 'best_model.pt')
-    config_path = os.path.join(results_dir, 'best_config.json')
 
-    # Check for required files
-    for path, name in [(model_path, 'best_model.pt'), (config_path, 'best_config.json')]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Required file {name} not found in {results_dir}")
-
-    # Load config from best_config.json (for reproducibility)
-    with open(config_path, 'r') as f:
-        loaded_config = json.load(f)
-    print(f"\nLoaded config from {config_path}")
-    print(f"  bag_weight: {loaded_config.get('bag_weight')}")
-    print(f"  dropout: {loaded_config.get('dropout')}")
-    print(f"  k_sample: {loaded_config.get('k_sample')}")
-
-    # Load patients and labels
     print("\nLoading data...")
     patients, labels, df = get_patients_and_labels(config.clinical_csv, config.features_dir)
 
@@ -485,7 +447,7 @@ def main():
 
     # Create and load model
     print("\nLoading model...")
-    model = create_model(loaded_config, config.embed_dim, device)
+    model = create_model(config, config.embed_dim, device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     print(f"Model loaded from {model_path}")

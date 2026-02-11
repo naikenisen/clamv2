@@ -19,7 +19,7 @@ import config
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.model import CLAM_SB, CLAM_MB, SmoothTop1SVM, FocalLoss, initialize_weights, initialize_attention_weights
+from src.model import CLAM_MODEL, SmoothTop1SVM, FocalLoss, initialize_weights, initialize_attention_weights
 from src.data_loader import CLAMDataset, collate_fn
 from torch.utils.data import DataLoader
 
@@ -126,13 +126,11 @@ def create_model(instance_loss_fn, device):
         'subtyping': config.subtyping,
         'embed_dim': config.embed_dim
     }
-    
-    model = CLAM_SB(**model_dict) if config.model_type == 'clam_sb' else CLAM_MB(**model_dict)
+    model = CLAM_MODEL(**model_dict)
     model.apply(initialize_weights)
     initialize_attention_weights(model.attention_net)
     for clf in model.instance_classifiers:
         initialize_attention_weights(clf)
-    
     return model.to(device)
 
 
@@ -142,7 +140,7 @@ def main():
     np.random.seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
-    device = torch.device('cuda' if config.device == 'cuda' and torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(config.output_dir, exist_ok=True)
     patients, labels, df = get_patients_and_labels(config.clinical_csv, config.features_dir)
     trainval_patients, test_patients, trainval_labels, test_labels = train_test_split(
