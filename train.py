@@ -220,8 +220,7 @@ def main():
         val_loss, val_auc, val_acc, _, _ = validate(model, val_loader, bag_loss_fn, device)
         
         print(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Val AUC: {val_auc:.4f}")
-        
-        # SAUVEGARDE DU MEILLEUR MODÈLE (CRUCIAL)
+
         if val_auc > best_val_auc:
             best_val_auc = val_auc
             best_epoch = epoch
