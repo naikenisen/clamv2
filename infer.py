@@ -328,26 +328,13 @@ def generate_attention_maps(model, loader, device, output_dir, dataset_dir='data
 
 
 def plot_roc_curves(train_probs, train_labels, test_probs, test_labels, output_path):
-    """
-    Plot ROC curves for train and test sets.
-    
-    Args:
-        train_probs: Predicted probabilities for train set (N, 2)
-        train_labels: True labels for train set
-        test_probs: Predicted probabilities for test set (N, 2)
-        test_labels: True labels for test set
-        output_path: Path to save the figure
-    """
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
-    # Colors
-    train_color = '#2196F3'  # Blue
-    test_color = '#F44336'   # Red
+    train_color = '#2196F3'
+    test_color = '#F44336'
     
     # ----- Plot 1: Train ROC -----
     fpr_train, tpr_train, _ = roc_curve(train_labels, train_probs[:, 1])
     roc_auc_train = auc(fpr_train, tpr_train)
-    
     axes[0].plot(fpr_train, tpr_train, color=train_color, lw=2, 
                  label=f'Train AUC = {roc_auc_train:.3f}')
     axes[0].plot([0, 1], [0, 1], 'k--', lw=1.5, label='Chance')
@@ -364,7 +351,6 @@ def plot_roc_curves(train_probs, train_labels, test_probs, test_labels, output_p
     # ----- Plot 2: Test ROC -----
     fpr_test, tpr_test, _ = roc_curve(test_labels, test_probs[:, 1])
     roc_auc_test = auc(fpr_test, tpr_test)
-    
     axes[1].plot(fpr_test, tpr_test, color=test_color, lw=2, 
                  label=f'Test AUC = {roc_auc_test:.3f}')
     axes[1].plot([0, 1], [0, 1], 'k--', lw=1.5, label='Chance')
@@ -396,11 +382,7 @@ def plot_roc_curves(train_probs, train_labels, test_probs, test_labels, output_p
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
-    print(f"ROC curves saved to {output_path}")
-    print(f"  Train AUC: {roc_auc_train:.4f}")
-    print(f"  Test AUC: {roc_auc_test:.4f}")
-    
+
     return roc_auc_train, roc_auc_test
 
 
@@ -446,84 +428,32 @@ def main():
     )
 
     # Create and load model
-    print("\nLoading model...")
     model = create_model(config, config.embed_dim, device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
-    print(f"Model loaded from {model_path}")
 
-    # =========================================================================
-    # GENERATE ROC CURVES
-    # =========================================================================
-    if not getattr(config, 'skip_roc', False):
-        print(f"\n{'='*60}")
-        print("GENERATING ROC CURVES")
-        print(f"{'='*60}")
-        # Get predictions
-        print("\nGetting train predictions...")
-        train_probs, train_labels, _ = get_predictions(model, train_loader, device)
-        print("Getting test predictions...")
-        test_probs, test_labels, _ = get_predictions(model, test_loader, device)
-        # Plot ROC curves
-        roc_path = os.path.join(results_dir, 'roc_curves.png')
-        train_auc, test_auc = plot_roc_curves(
-            train_probs, train_labels,
-            test_probs, test_labels,
-            roc_path
-        )
-        # Calculate and print additional metrics
-        print(f"\n--- Train Set Metrics ---")
-        train_preds = np.argmax(train_probs, axis=1)
-        train_acc = accuracy_score(train_labels, train_preds)
-        train_cm = confusion_matrix(train_labels, train_preds)
-        print(f"Accuracy: {train_acc:.4f}")
-        print(f"Confusion Matrix:\n{train_cm}")
-        print(f"\n--- Test Set Metrics ---")
-        test_preds = np.argmax(test_probs, axis=1)
-        test_acc = accuracy_score(test_labels, test_preds)
-        test_cm = confusion_matrix(test_labels, test_preds)
-        print(f"Accuracy: {test_acc:.4f}")
-        print(f"Confusion Matrix:\n{test_cm}")
+    # Get predictions
+    print("\nGetting train predictions...")
+    train_probs, train_labels, _ = get_predictions(model, train_loader, device)
+    print("Getting test predictions...")
+    test_probs, test_labels, _ = get_predictions(model, test_loader, device)
+    
+    # Plot ROC curves
+    roc_path = os.path.join(results_dir, 'roc_curves.png')
+    train_auc, test_auc = plot_roc_curves(
+        train_probs, train_labels,
+        test_probs, test_labels,
+        roc_path
+    )
 
-    # =========================================================================
-    # GENERATE ATTENTION MAPS
-    # =========================================================================
-    if not getattr(config, 'skip_attention_maps', False):
-        print(f"\n{'='*60}")
-        print("GENERATING ATTENTION MAPS")
-        print(f"{'='*60}")
-        attention_maps_dir = os.path.join(results_dir, 'attention_maps')
-        attention_results = generate_attention_maps(
-            model, test_loader, device, attention_maps_dir,
-            dataset_dir=getattr(config, 'dataset_dir', 'dataset'),
-            tile_size=getattr(config, 'tile_size', 256),
-            output_size=(getattr(config, 'output_size', 1024), getattr(config, 'output_size', 1024))
-        )
-        # Calculate and print summary
-        correct = sum(1 for r in attention_results if r['correct'])
-        total = len(attention_results)
-        print(f"\nAttention maps generated: {total}")
-        print(f"Correct predictions: {correct}/{total} ({100*correct/total:.1f}%)")
-        # Save attention results
-        attention_results_path = os.path.join(results_dir, 'attention_results.json')
-        with open(attention_results_path, 'w') as f:
-            json.dump(attention_results, f, indent=2)
-        print(f"Attention results saved to {attention_results_path}")
-
-    # =========================================================================
-    # SUMMARY
-    # =========================================================================
-    print(f"\n{'='*60}")
-    print("INFERENCE COMPLETE")
-    print(f"{'='*60}")
-    print(f"Results saved to: {results_dir}/")
-    if not getattr(config, 'skip_roc', False):
-        print(f"  - roc_curves.png: Train and Test ROC curves")
-    if not getattr(config, 'skip_attention_maps', False):
-        print(f"  - attention_maps/: Attention overlays on test images")
-        print(f"  - attention_results.json: Detailed prediction results")
-    print(f"{'='*60}")
-
+    # generate attention maps for test set
+    attention_maps_dir = os.path.join(results_dir, 'attention_maps')
+    attention_results = generate_attention_maps(
+        model, test_loader, device, attention_maps_dir,
+        dataset_dir=getattr(config, 'dataset_dir', 'dataset'),
+        tile_size=getattr(config, 'tile_size', 256),
+        output_size=(getattr(config, 'output_size', 1024), getattr(config, 'output_size', 1024))
+    )
 
 if __name__ == '__main__':
     main()
