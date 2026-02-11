@@ -8,7 +8,7 @@ Usage:
 
 import os
 import sys
-import argparse
+ # argparse removed, config.py used instead
 import json
 import numpy as np
 import torch
@@ -422,108 +422,93 @@ def main():
     
     # Model settings
     parser.add_argument('--embed_dim', type=int, default=768)
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--num_workers', type=int, default=4)
-    
-    # Attention maps settings
-    parser.add_argument('--tile_size', type=int, default=256,
-                        help='Tile size in pixels')
-    parser.add_argument('--output_size', type=int, default=1024,
-                        help='Output image size for attention maps')
-    
-    # Options
-    parser.add_argument('--skip_attention_maps', action='store_true',
-                        help='Skip attention map generation')
-    parser.add_argument('--skip_roc', action='store_true',
-                        help='Skip ROC curve generation')
-    
-    args = parser.parse_args()
-    
-    # Check results directory exists
-    if not os.path.exists(args.results_dir):
-        print(f"Error: Results directory not found: {args.results_dir}")
-        sys.exit(1)
-    
-    # Check for required files
-    model_path = os.path.join(args.results_dir, 'best_model.pt')
-    config_path = os.path.join(args.results_dir, 'best_config.json')
-    splits_path = os.path.join(args.results_dir, 'splits.json')
-    
-    for path, name in [(model_path, 'best_model.pt'), 
-                        (config_path, 'best_config.json'),
-                        (splits_path, 'splits.json')]:
-        if not os.path.exists(path):
-            print(f"Error: Required file not found: {path}")
-            sys.exit(1)
-    
-    # Setup device
-    device = torch.device('cuda' if args.device == 'cuda' and torch.cuda.is_available() else 'cpu')
+    # Import config
+    import config
+
+    # Set seeds
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.seed)
+    device = torch.device('cuda' if config.device == 'cuda' and torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # Load config
+
+    # Paths
+    results_dir = config.output_dir
+    model_path = os.path.join(results_dir, 'best_model.pt')
+    config_path = os.path.join(results_dir, 'best_config.json')
+
+    # Check for required files
+    for path, name in [(model_path, 'best_model.pt'), (config_path, 'best_config.json')]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Required file {name} not found in {results_dir}")
+
+    # Load config from best_config.json (for reproducibility)
     with open(config_path, 'r') as f:
-        config = json.load(f)
+        loaded_config = json.load(f)
     print(f"\nLoaded config from {config_path}")
-    print(f"  bag_weight: {config.get('bag_weight')}")
-    print(f"  dropout: {config.get('dropout')}")
-    print(f"  k_sample: {config.get('k_sample')}")
-    
-    # Load splits
-    with open(splits_path, 'r') as f:
-        splits = json.load(f)
-    train_patients = np.array(splits['trainval'])
-    test_patients = np.array(splits['test'])
-    print(f"\nLoaded splits from {splits_path}")
-    print(f"  Train patients: {len(train_patients)}")
-    print(f"  Test patients: {len(test_patients)}")
-    
-    # Load data
+    print(f"  bag_weight: {loaded_config.get('bag_weight')}")
+    print(f"  dropout: {loaded_config.get('dropout')}")
+    print(f"  k_sample: {loaded_config.get('k_sample')}")
+
+    # Load patients and labels
     print("\nLoading data...")
-    _, _, df = get_patients_and_labels(args.clinical_csv, args.features_dir)
-    
+    patients, labels, df = get_patients_and_labels(config.clinical_csv, config.features_dir)
+
+    # Split patients as in train.py
+    from sklearn.model_selection import train_test_split
+    trainval_patients, test_patients, trainval_labels, test_labels = train_test_split(
+        patients, labels,
+        test_size=config.test_size,
+        random_state=config.seed,
+        stratify=labels
+    )
+    train_patients, val_patients, train_labels, val_labels = train_test_split(
+        trainval_patients, trainval_labels,
+        test_size=config.val_size,
+        random_state=config.seed,
+        stratify=trainval_labels
+    )
+
     # Create datasets
-    train_dataset = CLAMDataset(train_patients, df, args.features_dir)
-    test_dataset = CLAMDataset(test_patients, df, args.features_dir)
-    
+    train_dataset = CLAMDataset(train_patients, df, config.features_dir)
+    test_dataset = CLAMDataset(test_patients, df, config.features_dir)
+
     train_loader = DataLoader(
         train_dataset, batch_size=1, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True
+        num_workers=config.num_workers, collate_fn=collate_fn, pin_memory=True
     )
     test_loader = DataLoader(
         test_dataset, batch_size=1, shuffle=False,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True
+        num_workers=config.num_workers, collate_fn=collate_fn, pin_memory=True
     )
-    
+
     # Create and load model
     print("\nLoading model...")
-    model = create_model(config, args.embed_dim, device)
+    model = create_model(loaded_config, config.embed_dim, device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     print(f"Model loaded from {model_path}")
-    
+
     # =========================================================================
     # GENERATE ROC CURVES
     # =========================================================================
-    if not args.skip_roc:
+    if not getattr(config, 'skip_roc', False):
         print(f"\n{'='*60}")
         print("GENERATING ROC CURVES")
         print(f"{'='*60}")
-        
         # Get predictions
         print("\nGetting train predictions...")
         train_probs, train_labels, _ = get_predictions(model, train_loader, device)
-        
         print("Getting test predictions...")
         test_probs, test_labels, _ = get_predictions(model, test_loader, device)
-        
         # Plot ROC curves
-        roc_path = os.path.join(args.results_dir, 'roc_curves.png')
+        roc_path = os.path.join(results_dir, 'roc_curves.png')
         train_auc, test_auc = plot_roc_curves(
             train_probs, train_labels,
             test_probs, test_labels,
             roc_path
         )
-        
         # Calculate and print additional metrics
         print(f"\n--- Train Set Metrics ---")
         train_preds = np.argmax(train_probs, axis=1)
@@ -531,52 +516,48 @@ def main():
         train_cm = confusion_matrix(train_labels, train_preds)
         print(f"Accuracy: {train_acc:.4f}")
         print(f"Confusion Matrix:\n{train_cm}")
-        
         print(f"\n--- Test Set Metrics ---")
         test_preds = np.argmax(test_probs, axis=1)
         test_acc = accuracy_score(test_labels, test_preds)
         test_cm = confusion_matrix(test_labels, test_preds)
         print(f"Accuracy: {test_acc:.4f}")
         print(f"Confusion Matrix:\n{test_cm}")
-    
+
     # =========================================================================
     # GENERATE ATTENTION MAPS
     # =========================================================================
-    if not args.skip_attention_maps:
+    if not getattr(config, 'skip_attention_maps', False):
         print(f"\n{'='*60}")
         print("GENERATING ATTENTION MAPS")
         print(f"{'='*60}")
-        
-        attention_maps_dir = os.path.join(args.results_dir, 'attention_maps')
+        attention_maps_dir = os.path.join(results_dir, 'attention_maps')
         attention_results = generate_attention_maps(
             model, test_loader, device, attention_maps_dir,
-            dataset_dir=args.dataset_dir,
-            tile_size=args.tile_size,
-            output_size=(args.output_size, args.output_size)
+            dataset_dir=getattr(config, 'dataset_dir', 'dataset'),
+            tile_size=getattr(config, 'tile_size', 256),
+            output_size=(getattr(config, 'output_size', 1024), getattr(config, 'output_size', 1024))
         )
-        
         # Calculate and print summary
         correct = sum(1 for r in attention_results if r['correct'])
         total = len(attention_results)
         print(f"\nAttention maps generated: {total}")
         print(f"Correct predictions: {correct}/{total} ({100*correct/total:.1f}%)")
-        
         # Save attention results
-        attention_results_path = os.path.join(args.results_dir, 'attention_results.json')
+        attention_results_path = os.path.join(results_dir, 'attention_results.json')
         with open(attention_results_path, 'w') as f:
             json.dump(attention_results, f, indent=2)
         print(f"Attention results saved to {attention_results_path}")
-    
+
     # =========================================================================
     # SUMMARY
     # =========================================================================
     print(f"\n{'='*60}")
     print("INFERENCE COMPLETE")
     print(f"{'='*60}")
-    print(f"Results saved to: {args.results_dir}/")
-    if not args.skip_roc:
+    print(f"Results saved to: {results_dir}/")
+    if not getattr(config, 'skip_roc', False):
         print(f"  - roc_curves.png: Train and Test ROC curves")
-    if not args.skip_attention_maps:
+    if not getattr(config, 'skip_attention_maps', False):
         print(f"  - attention_maps/: Attention overlays on test images")
         print(f"  - attention_results.json: Detailed prediction results")
     print(f"{'='*60}")
