@@ -43,9 +43,10 @@ class CLAMDataset(Dataset):
         for _, row in labels_df.iterrows():
             pid = str(int(row[id_col])) if pd.notna(row[id_col]) else None
             if pid and pd.notna(row[label_col]):
-                self.labels[pid] = int(row[label_col])
+                self.labels[pid] = int(row[label_col])  #Create dictionnary of patient id and label
         
         # Filter patient_ids to only those with labels and features
+        #Extract the embedded data of patient using id
         self.valid_patients = []
         for pid in patient_ids:
             pid_str = str(pid)
@@ -95,6 +96,7 @@ def collate_fn(batch):
     Custom collate function for variable bag sizes.
     Since bag sizes vary, we process one bag at a time (batch_size=1).
     For batch_size > 1, we would need padding.
+    If different instance is inside a bag, it will arrange the size to fit the batch_size
     """
     if len(batch) == 1:
         # Single sample - no need for padding
