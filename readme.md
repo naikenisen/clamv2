@@ -3,6 +3,8 @@
 # ClamV2 - Guide d'Utilisation
 Ce guide vous aidera à utiliser le projet ClamV2 pour l'extraction de features, l'entraînement de modèles et l'inférence.
 
+https://www.cancerimagingarchive.net/collection/dlbcl-morphology/
+
 ```bash
 # 1. Extraire les features
 python src/extract_features.py --tiles_dir dataset_tiles --output_dir features --tile_size 256
